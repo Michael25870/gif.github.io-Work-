@@ -571,7 +571,7 @@ window.getLocal = getLocal;
         window._isTogglingTask = false;
 
         const defaultTabVisibility = { patrol: true, gallery: true, timeline: true, memo: true, map: true, coldRoom: true, closing: true };
-const defaultTabOrder = ['patrol', 'gallery', 'timeline', 'memo', 'map', 'coldRoom', 'closing'];
+const defaultTabOrder = ['patrol', 'gallery', 'timeline', 'memo', 'map', 'coldRoom', 'closing', 'sched'];
 
 // 正確讀取本機設定，不要強制全部顯示
 let tabVisibilityState = getLocal('work_cache_tab_visibility', defaultTabVisibility);
@@ -584,7 +584,8 @@ const tabMetadataMap = {
     memo: { name: '備忘', btnId: 'tabMemo', icon: 'calendar-clock' },
     map: { name: '地圖', btnId: 'tabMap', icon: 'map' },
     coldRoom: { name: '雪房', btnId: 'tabColdRoom', icon: 'snowflake' },
-    closing: { name: '收工', btnId: 'tabClosing', icon: 'store' },    
+    closing: { name: '收工', btnId: 'tabClosing', icon: 'store' },
+    sched: { name: '排更', btnId: 'tabSched', icon: 'calendar-check' },    
 };
 
 // 只補「從來沒出現過」的分頁，不會把你已隱藏的打開
@@ -608,6 +609,175 @@ const tabMetadataMap = {
         safeSetLocal('work_tab_order_ids', tabOrderList);
     }
 })();
+
+        // ============================================================
+        // 🌟 自訂分頁模組：可「新建／移除」分頁，且每個分頁內可「新增／編輯／刪除／清空」記錄
+        // 資料存於本機(localStorage/IndexedDB)並同步至雲端(config)，跨裝置共用
+        // ============================================================
+        let customTabs = getLocal('work_cache_custom_tabs', []);          // [{id, name, created}]
+        let customTabData = getLocal('work_cache_custom_tab_data', {});   // { [tabId]: [ {id,title,note,ts} ] }
+        window._currentCustomTabId = '';
+
+        function persistCustomTabs() {
+            safeSetLocal('work_cache_custom_tabs', customTabs);
+            safeSetLocal('work_cache_custom_tab_data', customTabData);
+            safeSetLocal('work_cache_tab_visibility', tabVisibilityState);
+            safeSetLocal('work_tab_order_ids', tabOrderList);
+            if (currentUser && db) {
+                syncConfig('custom_tabs', { tabs: customTabs });
+                syncConfig('custom_tab_data', { data: customTabData });
+                syncConfig('tab_visibility', { visibility: tabVisibilityState, order: tabOrderList });
+            }
+        }
+
+        function ensureCustomTabsLoaded() {
+            if (!Array.isArray(customTabs)) customTabs = [];
+            customTabs.forEach(t => {
+                if (t && t.id && !tabMetadataMap[t.id]) {
+                    tabMetadataMap[t.id] = { name: t.name || '自訂', btnId: 'tab_' + t.id, icon: 'layout-list', custom: true };
+                    if (!tabOrderList.includes(t.id)) tabOrderList.push(t.id);
+                    if (tabVisibilityState[t.id] === undefined) tabVisibilityState[t.id] = true;
+                }
+            });
+            tabOrderList = tabOrderList.filter(k => !!tabMetadataMap[k]);
+        }
+        ensureCustomTabsLoaded();
+
+        window.createCustomTab = () => {
+            const name = window.prompt("請輸入新分頁名稱（例如：攤位紀錄、交接事項）：");
+            if (!name || !name.trim()) return;
+            const clean = name.trim();
+            const id = 'cust_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+            customTabs.push({ id, name: clean, created: Date.now() });
+            tabMetadataMap[id] = { name: clean, btnId: 'tab_' + id, icon: 'layout-list', custom: true };
+            if (!tabOrderList.includes(id)) tabOrderList.push(id);
+            tabVisibilityState[id] = true;
+            persistCustomTabs();
+            window.renderTabVisibilityList();
+            window.applyTabVisibility();
+            window.showToast(`✅ 已建立新分頁「${clean}」`);
+        };
+
+        window.renameCustomTab = (id) => {
+            const meta = tabMetadataMap[id];
+            if (!meta) return;
+            const name = window.prompt("輸入新的分頁名稱：", meta.name);
+            if (!name || !name.trim()) return;
+            const clean = name.trim();
+            meta.name = clean;
+            const t = customTabs.find(x => x.id === id);
+            if (t) t.name = clean;
+            persistCustomTabs();
+            window.renderTabVisibilityList();
+            window.applyTabVisibility();
+            if (window._currentCustomTabId === id) window.renderCustomTabPage(id);
+            window.showToast(`✅ 已重新命名為「${clean}」`);
+        };
+
+        window.removeCustomTab = (id) => {
+            const meta = tabMetadataMap[id];
+            window.showConfirm('移除分頁', `確定要移除「${meta?.name || '此'}」分頁及其內所有記錄嗎？`, () => {
+                customTabs = customTabs.filter(t => t.id !== id);
+                delete customTabData[id];
+                delete tabMetadataMap[id];
+                tabOrderList = tabOrderList.filter(k => k !== id);
+                delete tabVisibilityState[id];
+                persistCustomTabs();
+                // 一律先重建分頁列，避免殘留已被移除的按鈕
+                window.applyTabVisibility();
+                if (localStorage.getItem('activeTab') === id) {
+                    const first = tabOrderList.find(k => tabVisibilityState[k] !== false) || 'gallery';
+                    window.switchTab(first);
+                } else {
+                    window.renderTabVisibilityList();
+                }
+                window.showToast("🗑️ 已移除分頁");
+            });
+        };
+
+        // —— 自訂分頁內的記錄：新增 / 編輯 / 刪除 / 清空 ——
+        window.renderCustomTabPage = (id) => {
+            window._currentCustomTabId = id;
+            const meta = tabMetadataMap[id];
+            const nameEl = $('customTabName'); if (nameEl) nameEl.textContent = meta?.name || '自訂';
+            const list = $('customTabList'); if (!list) return;
+            const records = customTabData[id] || [];
+            if (!records.length) {
+                list.innerHTML = `<div class="flex flex-col items-center justify-center py-16 text-slate-400"><i data-lucide="inbox" class="w-10 h-10 mb-2 opacity-30"></i><span class="text-xs font-bold tracking-widest">此分頁尚無任何記錄</span></div>`;
+                if (window.lucide) lucide.createIcons({ root: list });
+                return;
+            }
+            list.innerHTML = records.map(r => `
+                <div class="bg-white border border-slate-200 rounded-xl p-2.5 shadow-2xs flex items-start gap-2 group">
+                    <div class="flex-1 min-w-0">
+                        <div class="font-black text-[13px] text-slate-800 leading-snug break-words">${r.title || '無標題'}</div>
+                        ${r.note ? `<div class="text-[11px] text-slate-500 mt-1 whitespace-pre-wrap break-words">${r.note}</div>` : ''}
+                        <div class="text-[9.5px] font-mono font-bold text-slate-400 mt-1">${window.crFormatTime ? window.crFormatTime(r.ts) : new Date(r.ts).toLocaleString()}</div>
+                    </div>
+                    <div class="flex items-center gap-1 shrink-0">
+                        <button type="button" onclick="window.editCustomRecord('${r.id}')" class="p-1.5 rounded-lg bg-slate-50 hover:bg-blue-50 text-blue-600 border border-slate-200/80 active:scale-95 transition-all" title="編輯"><i data-lucide="edit-3" class="w-3.5 h-3.5"></i></button>
+                        <button type="button" onclick="window.deleteCustomRecord('${r.id}')" class="p-1.5 rounded-lg bg-slate-50 hover:bg-red-50 text-slate-400 hover:text-red-500 border border-slate-200/80 active:scale-95 transition-all" title="刪除"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                    </div>
+                </div>`).join('');
+            if (window.lucide) lucide.createIcons({ root: list });
+        };
+
+        window.addCustomRecord = () => {
+            const id = window._currentCustomTabId; if (!id) return;
+            const title = ($('customRecordTitle')?.value || '').trim();
+            const note = ($('customRecordNote')?.value || '').trim();
+            if (!title) return window.showToast("請輸入標題", true);
+            if (!customTabData[id]) customTabData[id] = [];
+            customTabData[id].unshift({ id: 'cr_' + Date.now(), title, note: note || '', ts: Date.now() });
+            if ($('customRecordTitle')) $('customRecordTitle').value = '';
+            if ($('customRecordNote')) $('customRecordNote').value = '';
+            persistCustomTabs();
+            window.renderCustomTabPage(id);
+            window.showToast("✅ 已新增記錄");
+        };
+
+        window.deleteCustomRecord = (recId) => {
+            const id = window._currentCustomTabId; if (!id) return;
+            customTabData[id] = (customTabData[id] || []).filter(r => r.id !== recId);
+            persistCustomTabs();
+            window.renderCustomTabPage(id);
+            window.showToast("已刪除記錄");
+        };
+
+        window._editingCustomRecordId = '';
+        window.openCustomRecordEditModal = (recId) => {
+            const id = window._currentCustomTabId;
+            const rec = (customTabData[id] || []).find(r => r.id === recId);
+            if (!rec) return;
+            window._editingCustomRecordId = recId;
+            const t = $('crEditTitleInput'), n = $('crEditNoteInput');
+            if (t) t.value = rec.title || ''; if (n) n.value = rec.note || '';
+            $('customRecordEditModal')?.classList.replace('hidden', 'flex');
+            if (window.lucide) lucide.createIcons();
+        };
+        window.editCustomRecord = (recId) => window.openCustomRecordEditModal(recId);
+        window.closeCustomRecordEditModal = () => $('customRecordEditModal')?.classList.replace('flex', 'hidden');
+        window.saveCustomRecordEdit = () => {
+            const id = window._currentCustomTabId;
+            const t = ($('crEditTitleInput')?.value || '').trim();
+            const n = ($('crEditNoteInput')?.value || '').trim();
+            if (!t) return window.showToast("請輸入標題", true);
+            const rec = (customTabData[id] || []).find(r => r.id === window._editingCustomRecordId);
+            if (rec) { rec.title = t; rec.note = n; }
+            persistCustomTabs();
+            window.closeCustomRecordEditModal();
+            window.renderCustomTabPage(id);
+            window.showToast("✅ 已儲存修改");
+        };
+        window.clearCustomRecords = (id) => {
+            if (!customTabData[id] || !customTabData[id].length) return;
+            window.showConfirm('清空記錄', '確定要清空此分頁內的所有記錄嗎？', () => {
+                customTabData[id] = [];
+                persistCustomTabs();
+                window.renderCustomTabPage(id);
+                window.showToast("已清空全部記錄");
+            });
+        };
 
         window.applyTabVisibility = () => {
             const container = $('tabBarContainer');
@@ -680,8 +850,12 @@ const tabMetadataMap = {
                 </div>
                 <i data-lucide="${meta.icon}" class="w-4 h-4 text-slate-500"></i>
                 <span class="text-xs font-bold text-slate-800">${meta.name}</span>
+                ${meta.custom ? '<span class="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-200">自訂</span>' : ''}
             </div>
-            <input type="checkbox" id="tab_chk_${key}" ${checked ? 'checked' : ''} class="w-4 h-4 rounded text-blue-600 focus:ring-0 cursor-pointer">
+            <div class="flex items-center gap-1.5">
+                <input type="checkbox" id="tab_chk_${key}" ${checked ? 'checked' : ''} class="w-4 h-4 rounded text-blue-600 focus:ring-0 cursor-pointer">
+                ${meta.custom ? `<button type="button" onclick="window.removeCustomTab('${key}')" class="p-1 rounded bg-white hover:bg-red-50 text-slate-400 hover:text-red-500 border border-slate-200 shadow-2xs active:scale-90" title="移除分頁"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>` : ''}
+            </div>
         </div>`;
     }).join('');
 
@@ -3089,120 +3263,538 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
         let activeGridMember = null, isEditingMembers = false, isGridDragging = false, gridDragAction = null, splitHoursState = {};
         window.lastTouchedEl = null;
 
-        /* ====== 剔檔 (巡查) 105 檔官方核定名冊 ====== */
-        const RAW_PATROL_STALLS = [
-            // 花園仔 (23 檔)
-            { floor: "花園仔", id: "J-002", type: "雜貨類", name: "盧錦棠", gender: "男" },
-            { floor: "花園仔", id: "J-003", type: "雜貨類", name: "尹浩斌", gender: "男" },
-            { floor: "花園仔", id: "J-004", type: "雜貨類", name: "梁慧敏", gender: "女" },
-            { floor: "花園仔", id: "J-005", type: "雜貨類", name: "黃榮強", gender: "男" },
-            { floor: "花園仔", id: "J-007", type: "豆腐類", name: "許榮新", gender: "男" },
-            { floor: "花園仔", id: "J-008", type: "豆腐類", name: "黃順金", gender: "女" },
-            { floor: "花園仔", id: "J-009", type: "蔬菜類", name: "歐陽結艷", gender: "女" },
-            { floor: "花園仔", id: "J-012", type: "蔬菜類", name: "李麗珍", gender: "女" },
-            { floor: "花園仔", id: "J-013", type: "蔬菜類", name: "黃志聰", gender: "男" },
-            { floor: "花園仔", id: "J-014", type: "蔬菜類", name: "黃秀萍", gender: "女" },
-            { floor: "花園仔", id: "J-015", type: "蔬菜類", name: "黃玉蘭", gender: "女" },
-            { floor: "花園仔", id: "J-016", type: "雜貨類", name: "梁碧兒", gender: "女" },
-            { floor: "花園仔", id: "J-017", type: "雜貨類", name: "黃靜梅", gender: "女" },
-            { floor: "花園仔", id: "J-018", type: "冰鮮肉類", name: "甘林根", gender: "男" },
-            { floor: "花園仔", id: "J-020", type: "冰鮮肉類", name: "張文業", gender: "男" },
-            { floor: "花園仔", id: "J-021", type: "冰鮮肉類", name: "李樹強", gender: "男" },
-            { floor: "花園仔", id: "J-022", type: "冰鮮肉類", name: "歐陽結環", gender: "女" },
-            { floor: "花園仔", id: "J-024", type: "冰鮮肉類", name: "黃景緒", gender: "女" },
-            { floor: "花園仔", id: "J-025", type: "冰鮮肉類", name: "高志遠", gender: "男" },
-            { floor: "花園仔", id: "J-026", type: "蔬菜類", name: "陳瑞霞", gender: "女" },
-            { floor: "花園仔", id: "J-029", type: "蔬菜類", name: "甘容金", gender: "女" },
-            { floor: "花園仔", id: "J-030", type: "豆腐類", name: "歐鏡榴", gender: "女" },
-            { floor: "花園仔", id: "J-031", type: "豆腐類", name: "湯偉強", gender: "男" },
-
-            // 地下 (魚類 67 檔)
-            { floor: "地下", id: "R-002", type: "魚類", name: "吳惠芬", gender: "女" },
-            { floor: "地下", id: "R-003", type: "魚類", name: "高偉傑", gender: "男" },
-            { floor: "地下", id: "R-005", type: "魚類", name: "吳國雄", gender: "男" },
-            { floor: "地下", id: "R-006", type: "魚類", name: "周啟朗", gender: "男" },
-            { floor: "地下", id: "R-007", type: "魚類", name: "黎鳳好", gender: "女" },
-            { floor: "地下", id: "R-008", type: "魚類", name: "黃傑球", gender: "男" },
-            { floor: "地下", id: "R-009", type: "魚類", name: "周嘉華", gender: "男" },
-            { floor: "地下", id: "R-010", type: "魚類", name: "陳少萍", gender: "女" },
-            { floor: "地下", id: "R-012", type: "魚類", name: "李秀英", gender: "女" },
-            { floor: "地下", id: "R-013", type: "魚類", name: "譚沛文", gender: "男" },
-            { floor: "地下", id: "R-014", type: "魚類", name: "何桂英", gender: "女" },
-            { floor: "地下", id: "R-017", type: "魚類", name: "梁惠蘭", gender: "女" },
-            { floor: "地下", id: "R-019", type: "魚類", name: "李文輝", gender: "男" },
-            { floor: "地下", id: "R-020", type: "魚類", name: "許德榮", gender: "男" },
-            { floor: "地下", id: "R-021", type: "魚類", name: "關偉銘", gender: "男" },
-            { floor: "地下", id: "R-023", type: "魚類", name: "蕭永財", gender: "男" },
-            { floor: "地下", id: "R-024", type: "魚類", name: "李興強", gender: "男" },
-            { floor: "地下", id: "R-025", type: "魚類", name: "蕭柏豪", gender: "男" },
-            { floor: "地下", id: "R-026", type: "魚類", name: "樊美恩", gender: "女" },
-            { floor: "地下", id: "R-027", type: "魚類", name: "唐善堅", gender: "男" },
-            { floor: "地下", id: "R-028", type: "魚類", name: "梁帶娣", gender: "女" },
-            { floor: "地下", id: "R-029", type: "魚類", name: "蔡明", gender: "男" },
-            { floor: "地下", id: "R-030", type: "魚類", name: "周長梅", gender: "女" },
-            { floor: "地下", id: "R-031", type: "魚類", name: "吳錦培", gender: "男" },
-            { floor: "地下", id: "R-032", type: "魚類", name: "何建金", gender: "女" },
-            { floor: "地下", id: "R-033", type: "魚類", name: "何天就", gender: "男" },
-            { floor: "地下", id: "R-034", type: "魚類", name: "葉沛鉛", gender: "男" },
-            { floor: "地下", id: "R-035", type: "魚類", name: "吳美玲", gender: "女" },
-            { floor: "地下", id: "R-037", type: "魚類", name: "李志強", gender: "男" },
-            { floor: "地下", id: "R-039", type: "魚類", name: "何笑玲", gender: "女" },
-            { floor: "地下", id: "R-040", type: "魚類", name: "陳悅歡", gender: "女" },
-            { floor: "地下", id: "R-042", type: "魚類", name: "陳錦蘭", gender: "女" },
-            { floor: "地下", id: "R-043", type: "魚類", name: "林文健", gender: "男" },
-            { floor: "地下", id: "R-044", type: "魚類", name: "楊觀蓮", gender: "女" },
-            { floor: "地下", id: "R-045", type: "魚類", name: "鍾銘賢", gender: "男" },
-            { floor: "地下", id: "R-046", type: "魚類", name: "林惠珍", gender: "女" },
-            { floor: "地下", id: "R-050", type: "魚類", name: "盧梅珍", gender: "女" },
-            { floor: "地下", id: "R-051", type: "魚類", name: "吳仲輝", gender: "男" },
-            { floor: "地下", id: "R-053", type: "魚類", name: "鄭金海", gender: "男" },
-            { floor: "地下", id: "R-054", type: "魚類", name: "梁轉好", gender: "女" },
-            { floor: "地下", id: "R-055", type: "魚類", name: "羅連帶", gender: "女" },
-            { floor: "地下", id: "R-057", type: "魚類", name: "林玉鳳", gender: "女" },
-            { floor: "地下", id: "R-058", type: "魚類", name: "陳敏怡", gender: "女" },
-            { floor: "地下", id: "R-059", type: "魚類", name: "梁志明", gender: "男" },
-            { floor: "地下", id: "R-060", type: "魚類", name: "梁展鵬", gender: "男" },
-            { floor: "地下", id: "R-061", type: "魚類", name: "柯惠儀", gender: "女" },
-            { floor: "地下", id: "R-062", type: "魚類", name: "黃少珍", gender: "女" },
-            { floor: "地下", id: "R-063", type: "魚類", name: "歐仲良", gender: "男" },
-            { floor: "地下", id: "R-064", type: "魚類", name: "蘇麗影", gender: "女" },
-            { floor: "地下", id: "R-065", type: "魚類", name: "冼嘉欣", gender: "女" },
-            { floor: "地下", id: "R-066", type: "魚類", name: "彭海豐", gender: "男" },
-            { floor: "地下", id: "R-067", type: "魚類", name: "陳添友", gender: "男" },
-            { floor: "地下", id: "R-069", type: "魚類", name: "林耀新", gender: "男" },
-            { floor: "地下", id: "R-070", type: "魚類", name: "陳少珍", gender: "女" },
-            { floor: "地下", id: "R-071", type: "魚類", name: "楊劍光", gender: "男" },
-            { floor: "地下", id: "R-072", type: "魚類", name: "關棨豪", gender: "男" },
-            { floor: "地下", id: "R-073", type: "魚類", name: "關超文", gender: "男" },
-            { floor: "地下", id: "R-074", type: "魚類", name: "吳麗玲", gender: "女" },
-            { floor: "地下", id: "R-076", type: "魚類", name: "梁志偉", gender: "男" },
-            { floor: "地下", id: "R-078", type: "魚類", name: "何玉卿", gender: "女" },
-            { floor: "地下", id: "R-079", type: "魚類", name: "高建成", gender: "男" },
-            { floor: "地下", id: "R-080", type: "魚類", name: "鍾添", gender: "男" },
-            { floor: "地下", id: "R-081", type: "魚類", name: "李盧梅娟", gender: "女" },
-            { floor: "地下", id: "R-082", type: "魚類", name: "何鈿", gender: "男" },
-            { floor: "地下", id: "R-085", type: "魚類", name: "梁日成", gender: "男" },
-            { floor: "地下", id: "R-086", type: "魚類", name: "蘇麗珍", gender: "女" },
-            { floor: "地下", id: "R-087", type: "魚類", name: "譚潤華", gender: "男" },
-
-            // 一樓 (豬肉類 / 牛肉類 15 檔)
-            { floor: "一樓", id: "1-001", type: "豬肉類", name: "鄭錫霖", gender: "男" },
-            { floor: "一樓", id: "1-002", type: "豬肉類", name: "余家昇", gender: "男" },
-            { floor: "一樓", id: "1-003", type: "豬肉類", name: "馮春育", gender: "男" },
-            { floor: "一樓", id: "1-005", type: "牛肉類", name: "張俠川", gender: "男" },
-            { floor: "一樓", id: "1-006", type: "豬肉類", name: "余偉強", gender: "男" },
-            { floor: "一樓", id: "1-010", type: "豬肉類", name: "梁中", gender: "男" },
-            { floor: "一樓", id: "1-013", type: "豬肉類", name: "曾永洪", gender: "男" },
-            { floor: "一樓", id: "1-014", type: "豬肉類", name: "周笑崧", gender: "女" },
-            { floor: "一樓", id: "1-015", type: "豬肉類", name: "曾沃孝", gender: "男" },
-            { floor: "一樓", id: "1-018", type: "牛肉類", name: "何森寧", gender: "男" },
-            { floor: "一樓", id: "1-019", type: "豬肉類", name: "歐陽燕", gender: "女" },
-            // 一樓 (豬肉類 / 牛肉類 15 檔)
-            { floor: "一樓", id: "1-020", type: "豬肉類", name: "黃樹根", gender: "男" },
-            { floor: "一樓", id: "1-021", type: "豬肉類", name: "陳麗新", gender: "女" },
-            { floor: "一樓", id: "1-023", type: "豬肉類", name: "羅志友", gender: "男" },
-            { floor: "一樓", id: "1-024", type: "豬肉類", name: "邱其仁", gender: "男" }
+        /* ====== 剔檔 (巡查) 名冊（由 10 月份官方每日營業記錄匯入：地下 / 一樓 / 二樓 共 175 檔） ====== */
+                const RAW_PATROL_STALLS = [
+            {"floor": "二樓", "id": "3-01", "type": "飯類、麵食、小菜", "name": "梁明立", "gender": ""},
+            {"floor": "二樓", "id": "3-02", "type": "紅豆餅、糕點、飲料", "name": "吳志光", "gender": ""},
+            {"floor": "二樓", "id": "3-03", "type": "油炸小食、飲料", "name": "譚嘉裕", "gender": ""},
+            {"floor": "二樓", "id": "3-04", "type": "腸粉", "name": "梁淑賢", "gender": ""},
+            {"floor": "二樓", "id": "3-05", "type": "飯類、麵食、飲料", "name": "洪勝權", "gender": ""},
+            {"floor": "二樓", "id": "3-06", "type": "麵食、小食、飲料", "name": "梁建榮", "gender": ""},
+            {"floor": "二樓", "id": "3-07", "type": "麵食、麵包、飲料", "name": "蔡建妹", "gender": ""},
+            {"floor": "二樓", "id": "3-08", "type": "", "name": "", "gender": ""},
+            {"floor": "二樓", "id": "3-09", "type": "糖水、飲料", "name": "吳碧琴", "gender": ""},
+            {"floor": "二樓", "id": "3-10", "type": "豆漿、豆腐花、飲料", "name": "黎桂清", "gender": ""},
+            {"floor": "二樓", "id": "3-11", "type": "腸粉、燒烤食品、飲料", "name": "陳敏青", "gender": ""},
+            {"floor": "二樓", "id": "3-12", "type": "點心、飲料、甜品", "name": "陳玉珍", "gender": ""},
+            {"floor": "二樓", "id": "3-13", "type": "牛雜、麵食、飲料", "name": "麥棣華", "gender": ""},
+            {"floor": "二樓", "id": "3-14", "type": "麵食", "name": "李加洪", "gender": ""},
+            {"floor": "二樓", "id": "3-15", "type": "炒粉麵、糭、糕點", "name": "趙靜", "gender": ""},
+            {"floor": "二樓", "id": "3-16", "type": "糕點", "name": "周庭羨", "gender": ""},
+            {"floor": "二樓", "id": "3-17", "type": "麵食、糕點、飲料", "name": "梁籍基", "gender": ""},
+            {"floor": "二樓", "id": "3-18", "type": "糖水", "name": "郭玉媛", "gender": ""},
+            {"floor": "二樓", "id": "3-19", "type": "", "name": "", "gender": ""},
+            {"floor": "二樓", "id": "3-20", "type": "糖水", "name": "陳振權", "gender": ""},
+            {"floor": "二樓", "id": "3-21", "type": "", "name": "", "gender": ""},
+            {"floor": "二樓", "id": "3-22", "type": "麵食", "name": "楊麗詩", "gender": ""},
+            {"floor": "二樓", "id": "3-23", "type": "腸粉、麵食、粥", "name": "謝少紅", "gender": ""},
+            {"floor": "二樓", "id": "3-24", "type": "飲料、麵包、麵食", "name": "陳振業", "gender": ""},
+            {"floor": "二樓", "id": "3-25", "type": "飲料、麵包、麵食", "name": "黃可兒", "gender": ""},
+            {"floor": "二樓", "id": "3-26", "type": "麵食、飲料", "name": "郭幸培", "gender": ""},
+            {"floor": "二樓", "id": "3-27", "type": "煲仔飯、麵食、飲料", "name": "余永源", "gender": ""},
+            {"floor": "二樓", "id": "3-28", "type": "粥", "name": "歐銀珍", "gender": ""},
+            {"floor": "二樓", "id": "3-29", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "001", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "002", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "003", "type": "豬肉類", "name": "龔偉雄", "gender": ""},
+            {"floor": "一樓", "id": "004", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "005", "type": "豬肉類", "name": "周裕輝", "gender": ""},
+            {"floor": "一樓", "id": "006", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "007", "type": "豬肉類", "name": "余志勇", "gender": ""},
+            {"floor": "一樓", "id": "008", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "009", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "010", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "011", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "012", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "013", "type": "豬肉類", "name": "龔淑芬", "gender": ""},
+            {"floor": "一樓", "id": "014", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "015", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "017", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "018", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "019", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "020", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "021", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "022", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "023", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "024", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "025", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "026", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "027", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "028", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "029", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "030", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "031", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "032", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "033", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "034", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "035", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "036", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "037", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "038", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "039", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "040", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "041", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "042", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "043", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "044", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "045", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "046", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "047", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "048", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "049", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "050", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "051", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "052", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "053", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "059", "type": "凍肉類", "name": "梁黃堃瑩", "gender": ""},
+            {"floor": "一樓", "id": "060", "type": "凍肉類", "name": "黃寶玲", "gender": ""},
+            {"floor": "一樓", "id": "061", "type": "凍肉類", "name": "黃宇揚", "gender": ""},
+            {"floor": "一樓", "id": "062", "type": "牛肉類", "name": "李遠強", "gender": ""},
+            {"floor": "一樓", "id": "063", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "064", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "065", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "067", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "068", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "069", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "070", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "071", "type": "", "name": "", "gender": ""},
+            {"floor": "一樓", "id": "072", "type": "冰鮮三鳥類", "name": "麥嘉麗", "gender": ""},
+            {"floor": "一樓", "id": "073", "type": "冰鮮三鳥類", "name": "麥炳權", "gender": ""},
+            {"floor": "一樓", "id": "074", "type": "凍肉類", "name": "伍翠嬋", "gender": ""},
+            {"floor": "地下", "id": "001", "type": "魚類", "name": "李富源", "gender": ""},
+            {"floor": "地下", "id": "002", "type": "魚類", "name": "關國猛", "gender": ""},
+            {"floor": "地下", "id": "003", "type": "魚類", "name": "黎麗芳", "gender": ""},
+            {"floor": "地下", "id": "004", "type": "生果類", "name": "李洪基", "gender": ""},
+            {"floor": "地下", "id": "005", "type": "生果類", "name": "黃順玲", "gender": ""},
+            {"floor": "地下", "id": "006", "type": "豆腐及芽菜類", "name": "陳金權", "gender": ""},
+            {"floor": "地下", "id": "007", "type": "魚類", "name": "羅志輝", "gender": ""},
+            {"floor": "地下", "id": "008", "type": "魚類", "name": "余適蘭", "gender": ""},
+            {"floor": "地下", "id": "009", "type": "魚類", "name": "梁金彩", "gender": ""},
+            {"floor": "地下", "id": "010", "type": "魚類", "name": "郭少康", "gender": ""},
+            {"floor": "地下", "id": "011", "type": "魚類", "name": "羅煥彩", "gender": ""},
+            {"floor": "地下", "id": "012", "type": "魚類", "name": "徐靖敏", "gender": ""},
+            {"floor": "地下", "id": "013", "type": "魚類", "name": "黃五妹", "gender": ""},
+            {"floor": "地下", "id": "014", "type": "魚類", "name": "余嘉利", "gender": ""},
+            {"floor": "地下", "id": "015", "type": "魚類", "name": "李玉珠", "gender": ""},
+            {"floor": "地下", "id": "016", "type": "蔬菜類", "name": "霍少芬", "gender": ""},
+            {"floor": "地下", "id": "017", "type": "蔬菜類", "name": "李錦清", "gender": ""},
+            {"floor": "地下", "id": "018", "type": "蔬菜類", "name": "陳觀好", "gender": ""},
+            {"floor": "地下", "id": "019", "type": "魚類", "name": "曾啟華", "gender": ""},
+            {"floor": "地下", "id": "020", "type": "魚類", "name": "楊均培", "gender": ""},
+            {"floor": "地下", "id": "021", "type": "魚類", "name": "梁志有", "gender": ""},
+            {"floor": "地下", "id": "022", "type": "魚類", "name": "徐金蓮", "gender": ""},
+            {"floor": "地下", "id": "023", "type": "魚類", "name": "杜志祥", "gender": ""},
+            {"floor": "地下", "id": "024", "type": "魚類", "name": "盧亞基", "gender": ""},
+            {"floor": "地下", "id": "025", "type": "魚類", "name": "郭根仔", "gender": ""},
+            {"floor": "地下", "id": "026", "type": "魚類", "name": "羅灶喜", "gender": ""},
+            {"floor": "地下", "id": "027", "type": "", "name": "", "gender": ""},
+            {"floor": "地下", "id": "028", "type": "魚類", "name": "劉道鳳", "gender": ""},
+            {"floor": "地下", "id": "029", "type": "", "name": "", "gender": ""},
+            {"floor": "地下", "id": "030", "type": "魚類", "name": "王金妹", "gender": ""},
+            {"floor": "地下", "id": "031", "type": "蔬菜類", "name": "李紅蓮", "gender": ""},
+            {"floor": "地下", "id": "032", "type": "蔬菜類", "name": "李潤蓮", "gender": ""},
+            {"floor": "地下", "id": "033", "type": "蔬菜類", "name": "梁連好", "gender": ""},
+            {"floor": "地下", "id": "034", "type": "蔬菜類", "name": "謝麗文", "gender": ""},
+            {"floor": "地下", "id": "035", "type": "魚類", "name": "馮笑桃", "gender": ""},
+            {"floor": "地下", "id": "036", "type": "魚類", "name": "張志明", "gender": ""},
+            {"floor": "地下", "id": "037", "type": "魚類", "name": "關朋新", "gender": ""},
+            {"floor": "地下", "id": "038", "type": "魚類", "name": "張子玲", "gender": ""},
+            {"floor": "地下", "id": "039", "type": "魚類", "name": "陳偉灝", "gender": ""},
+            {"floor": "地下", "id": "040", "type": "", "name": "", "gender": ""},
+            {"floor": "地下", "id": "041", "type": "魚類", "name": "黃桂珍", "gender": ""},
+            {"floor": "地下", "id": "042", "type": "魚類", "name": "羅彩鳳", "gender": ""},
+            {"floor": "地下", "id": "043", "type": "魚類", "name": "高德勝", "gender": ""},
+            {"floor": "地下", "id": "044", "type": "魚類", "name": "湯淑儀", "gender": ""},
+            {"floor": "地下", "id": "045", "type": "魚類", "name": "袁淑英", "gender": ""},
+            {"floor": "地下", "id": "046", "type": "蛋類", "name": "羅連卿", "gender": ""},
+            {"floor": "地下", "id": "047", "type": "蛋類", "name": "李錦恩", "gender": ""},
+            {"floor": "地下", "id": "048", "type": "雜貨類", "name": "陳國偉", "gender": ""},
+            {"floor": "地下", "id": "049", "type": "魚類", "name": "何艷絲", "gender": ""},
+            {"floor": "地下", "id": "050", "type": "魚類", "name": "何玉珍", "gender": ""},
+            {"floor": "地下", "id": "051", "type": "魚類", "name": "王嘉麗", "gender": ""},
+            {"floor": "地下", "id": "052", "type": "魚類", "name": "何燕婷", "gender": ""},
+            {"floor": "地下", "id": "053", "type": "魚類", "name": "郭少茵", "gender": ""},
+            {"floor": "地下", "id": "054", "type": "魚類", "name": "何志龍", "gender": ""},
+            {"floor": "地下", "id": "055", "type": "魚類", "name": "陳秋花", "gender": ""},
+            {"floor": "地下", "id": "056", "type": "", "name": "", "gender": ""},
+            {"floor": "地下", "id": "057", "type": "魚類", "name": "盧錦添", "gender": ""},
+            {"floor": "地下", "id": "058", "type": "", "name": "", "gender": ""},
+            {"floor": "地下", "id": "059", "type": "魚類", "name": "吳二好", "gender": ""},
+            {"floor": "地下", "id": "060", "type": "魚類", "name": "梁金鳳", "gender": ""},
+            {"floor": "地下", "id": "061", "type": "魚類", "name": "黃金福", "gender": ""},
+            {"floor": "地下", "id": "062", "type": "魚類", "name": "梁華根", "gender": ""},
+            {"floor": "地下", "id": "063", "type": "魚類", "name": "郭妹", "gender": ""},
+            {"floor": "地下", "id": "064", "type": "魚類", "name": "鄭繼好", "gender": ""},
+            {"floor": "地下", "id": "065", "type": "魚類", "name": "盧培蓮", "gender": ""},
+            {"floor": "地下", "id": "066", "type": "魚類", "name": "張官德", "gender": ""},
+            {"floor": "地下", "id": "067", "type": "魚類", "name": "黎十妹", "gender": ""},
+            {"floor": "地下", "id": "068", "type": "魚類", "name": "郭嘉麗", "gender": ""},
+            {"floor": "地下", "id": "069", "type": "魚類", "name": "陳遠琼", "gender": ""},
+            {"floor": "地下", "id": "070", "type": "魚類", "name": "張敏釗", "gender": ""},
+            {"floor": "地下", "id": "071", "type": "魚類", "name": "郭玉珍", "gender": ""},
+            {"floor": "地下", "id": "072", "type": "魚類", "name": "何華灶", "gender": ""},
+            {"floor": "地下", "id": "073", "type": "魚類", "name": "梁貴有", "gender": ""},
+            {"floor": "地下", "id": "074", "type": "魚類", "name": "李平得", "gender": ""},
+            {"floor": "地下", "id": "075", "type": "魚類", "name": "冼八妹", "gender": ""},
+            {"floor": "地下", "id": "076", "type": "魚類", "name": "林灣佬", "gender": ""},
+            {"floor": "地下", "id": "077", "type": "魚類", "name": "楊初二", "gender": ""},
+            {"floor": "地下", "id": "078", "type": "魚類", "name": "關美英", "gender": ""},
+            {"floor": "地下", "id": "079", "type": "魚類", "name": "梁全", "gender": ""},
         ];
+
+
+        /* ====== 可編輯巡查名冊 + 版本控制（即時自行更改、全欄位可編輯、多版本切換） ====== */
+        const prEsc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+        // 內建名冊版本：升級時自動以內建名冊覆蓋瀏覽器舊快照（資料從 10 月份官方名冊匯入）
+        const BUILTIN_ROSTER_VERSION = 20261030;
+        let patrolRoster = null;
+        const savedRosterVer = getLocal('work_cache_patrol_roster_ver', 0);
+        const savedRoster = getLocal('work_cache_patrol_roster', null);
+        if (savedRosterVer < BUILTIN_ROSTER_VERSION || !savedRoster || !Array.isArray(savedRoster) || savedRoster.length === 0) {
+            patrolRoster = JSON.parse(JSON.stringify(RAW_PATROL_STALLS));
+            safeSetLocal('work_cache_patrol_roster', patrolRoster);
+            safeSetLocal('work_cache_patrol_roster_ver', BUILTIN_ROSTER_VERSION);
+        } else {
+            patrolRoster = savedRoster;
+        }
+        let patrolRosterVersions = getLocal('work_cache_patrol_roster_versions', []);
+        if (!Array.isArray(patrolRosterVersions)) patrolRosterVersions = [];
+        window.patrolRoster = patrolRoster;
+        window.patrolRosterVersions = patrolRosterVersions;
+
+        window.savePatrolRoster = () => {
+            safeSetLocal('work_cache_patrol_roster', patrolRoster);
+            safeSetLocal('work_cache_patrol_roster_ver', BUILTIN_ROSTER_VERSION);
+            if (window.syncConfig) window.syncConfig('patrol_roster', { roster: patrolRoster, ver: BUILTIN_ROSTER_VERSION });
+            // 確保名冊內的樓層都出現在樓層清單（載入舊版本時自動補上）
+            let merged = false;
+            if (typeof patrolFloors !== 'undefined') {
+                patrolRoster.forEach(s => { if (s.floor && patrolFloors.indexOf(s.floor) === -1) { patrolFloors.push(s.floor); merged = true; } });
+                if (merged) {
+                    safeSetLocal('work_cache_patrol_floors', patrolFloors);
+                    if (window.syncConfig) window.syncConfig('patrol_floors', { floors: patrolFloors });
+                    if (window.renderPatrolFloorSlider) window.renderPatrolFloorSlider();
+                    if (window.renderPatrolRosterFloorSelect) window.renderPatrolRosterFloorSelect();
+                }
+            }
+            if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+            if (window.renderPatrolRosterManager) window.renderPatrolRosterManager();
+            if (window.renderPatrolVersionsList) window.renderPatrolVersionsList();
+        };
+        window.savePatrolRosterVersions = () => {
+            safeSetLocal('work_cache_patrol_roster_versions', patrolRosterVersions);
+            if (window.syncConfig) window.syncConfig('patrol_roster_versions', { versions: patrolRosterVersions });
+            if (window.renderPatrolVersionsList) window.renderPatrolVersionsList();
+        };
+        window.setPatrolRoster = (next) => {
+            patrolRoster = Array.isArray(next) && next.length ? next : JSON.parse(JSON.stringify(RAW_PATROL_STALLS));
+            window.patrolRoster = patrolRoster;
+            window.savePatrolRoster();
+        };
+
+        // ---- 名冊編輯：新增 / 修改欄位 / 刪除 / 排序 / 還原 ----
+        window.openPatrolRosterModal = () => {
+            const m = $('patrolRosterModal'); if (!m) return;
+            m.classList.replace('hidden', 'flex');
+            window.renderPatrolRosterManager();
+            window.renderPatrolVersionsList();
+        };
+        window.closePatrolRosterModal = () => { const m = $('patrolRosterModal'); if (m) m.classList.replace('flex', 'hidden'); };
+
+        window.renderPatrolRosterManager = () => {
+            const tbody = $('patrolRosterTbody'); if (!tbody) return;
+            if ($('prTotalCount')) $('prTotalCount').textContent = patrolRoster.length;
+            tbody.innerHTML = patrolRoster.map((s, i) => `
+                <tr class="border-b border-slate-100">
+                    <td class="py-0.5 px-0.5">
+                        <div class="flex flex-col items-center gap-0.5">
+                            <button type="button" onclick="window.movePatrolStall(${i}, -1)" class="text-slate-400 hover:text-blue-600 p-0.5"><i data-lucide="chevron-up" class="w-3 h-3"></i></button>
+                            <button type="button" onclick="window.movePatrolStall(${i}, 1)" class="text-slate-400 hover:text-blue-600 p-0.5"><i data-lucide="chevron-down" class="w-3 h-3"></i></button>
+                        </div>
+                    </td>
+                    <td class="py-0.5 px-0.5"><input value="${prEsc(s.floor)}" class="pr-field w-14 bg-slate-50 border border-slate-200 rounded px-1 py-0.5 text-[10px] font-bold focus:border-blue-500 focus:outline-none" onchange="window.updatePatrolStallField(${i},'floor',this.value)"></td>
+                    <td class="py-0.5 px-0.5"><input value="${prEsc(s.id)}" class="pr-field w-16 bg-slate-50 border border-slate-200 rounded px-1 py-0.5 text-[10px] font-mono font-bold focus:border-blue-500 focus:outline-none" onchange="window.updatePatrolStallField(${i},'id',this.value)"></td>
+                    <td class="py-0.5 px-0.5"><input value="${prEsc(s.name)}" class="pr-field w-16 bg-slate-50 border border-slate-200 rounded px-1 py-0.5 text-[10px] font-bold focus:border-blue-500 focus:outline-none" onchange="window.updatePatrolStallField(${i},'name',this.value)"></td>
+                    <td class="py-0.5 px-0.5"><input value="${prEsc(s.gender||'')}" class="pr-field w-8 bg-slate-50 border border-slate-200 rounded px-1 py-0.5 text-[10px] text-center focus:border-blue-500 focus:outline-none" onchange="window.updatePatrolStallField(${i},'gender',this.value)"></td>
+                    <td class="py-0.5 px-0.5"><input value="${prEsc(s.type||'')}" class="pr-field w-14 bg-slate-50 border border-slate-200 rounded px-1 py-0.5 text-[10px] focus:border-blue-500 focus:outline-none" onchange="window.updatePatrolStallField(${i},'type',this.value)"></td>
+                    <td class="py-0.5 px-0.5 text-right">
+                        <button type="button" onclick="window.deletePatrolStall(${i})" class="text-red-400 hover:text-red-600 p-0.5"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                    </td>
+                </tr>`).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.updatePatrolStallField = (i, field, value) => {
+            if (!patrolRoster[i]) return;
+            patrolRoster[i][field] = value;
+            window.savePatrolRoster();
+        };
+        window.movePatrolStall = (i, dir) => {
+            const j = i + dir;
+            if (j < 0 || j >= patrolRoster.length) return;
+            const tmp = patrolRoster[i]; patrolRoster[i] = patrolRoster[j]; patrolRoster[j] = tmp;
+            window.savePatrolRoster();
+        };
+        window.deletePatrolStall = (i) => {
+            const s = patrolRoster[i]; if (!s) return;
+            window.showConfirm('刪除攤位', `確定從巡查名冊刪除「${s.floor} ${s.id} ${s.name}」？`, () => {
+                patrolRoster.splice(i, 1);
+                window.savePatrolRoster();
+                window.showToast('已從巡查名冊刪除');
+            });
+        };
+        window.addPatrolStallFromForm = () => {
+            const id = ($('prNewId')?.value || '').trim();
+            const floor = ($('prNewFloor')?.value || '地下').trim();
+            const name = ($('prNewName')?.value || '').trim();
+            const gender = ($('prNewGender')?.value || '男').trim();
+            const type = ($('prNewType')?.value || '雜貨類').trim();
+            if (!id || !name) { window.showToast('請填寫檔號與姓名', true); return; }
+            if (patrolRoster.some(s => String(s.id).toLowerCase() === id.toLowerCase() && String(s.floor).toLowerCase() === floor.toLowerCase())) {
+                window.showToast('此檔號已存在於同一樓層', true); return;
+            }
+            patrolRoster.push({ id, floor, type, name, gender });
+            ['prNewId','prNewName'].forEach(k => { const el = $(k); if (el) el.value = ''; });
+            window.savePatrolRoster();
+            window.showToast('✅ 已新增至巡查名冊');
+        };
+        window.resetPatrolRosterToOfficial = () => {
+            window.showConfirm('還原官方名冊', `將以「官方核定 ${RAW_PATROL_STALLS.length} 檔」覆蓋現役名冊，確定？`, () => {
+                window.setPatrolRoster(JSON.parse(JSON.stringify(RAW_PATROL_STALLS)));
+                window.showToast(`✅ 已還原為官方 ${RAW_PATROL_STALLS.length} 檔`);
+            });
+        };
+
+        // ---- 版本控制：另存版本 / 載入 / 刪除 ----
+        window.saveCurrentRosterAsVersion = () => {
+            const name = prompt('為此版本命名（例：2026年11月版）');
+            if (name === null) return;
+            const vName = (name || '').trim();
+            if (!vName) { window.showToast('版本名稱不能為空', true); return; }
+            patrolRosterVersions.unshift({
+                id: 'pv_' + Date.now(),
+                name: vName,
+                date: window.formatDateStrHK ? window.formatDateStrHK() : new Date().toISOString().slice(0, 10),
+                count: patrolRoster.length,
+                stalls: JSON.parse(JSON.stringify(patrolRoster))
+            });
+            window.savePatrolRosterVersions();
+            window.showToast('✅ 已另存為版本');
+        };
+        window.loadPatrolRosterVersion = (vid) => {
+            const v = patrolRosterVersions.find(x => x.id === vid); if (!v) return;
+            window.showConfirm('載入版本', `確定以版本「${v.name}」(${v.count} 檔) 覆蓋現役名冊？`, () => {
+                window.setPatrolRoster(JSON.parse(JSON.stringify(v.stalls)));
+                window.showToast(`✅ 已載入版本「${v.name}」`);
+            });
+        };
+        window.deletePatrolRosterVersion = (vid) => {
+            const v = patrolRosterVersions.find(x => x.id === vid); if (!v) return;
+            window.showConfirm('刪除版本', `確定刪除版本「${v.name}」？`, () => {
+                patrolRosterVersions = patrolRosterVersions.filter(x => x.id !== vid);
+                window.savePatrolRosterVersions();
+                window.showToast('已刪除版本');
+            });
+        };
+        window.renderPatrolVersionsList = () => {
+            const c = $('patrolVersionsList'); if (!c) return;
+            if (!patrolRosterVersions.length) {
+                c.innerHTML = '<p class="text-xs text-slate-400 text-center py-3">尚未保存任何版本。編輯名冊後按「另存為版本」即可建立。</p>';
+                return;
+            }
+            c.innerHTML = patrolRosterVersions.map(v => `
+                <div class="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-2">
+                    <div class="min-w-0">
+                        <div class="text-xs font-black text-slate-700 truncate">${prEsc(v.name)}</div>
+                        <div class="text-[10px] text-slate-400 font-mono mt-0.5">${prEsc(v.date)} · ${v.count} 檔</div>
+                    </div>
+                    <div class="flex items-center gap-1 shrink-0">
+                        <button type="button" onclick="window.loadPatrolRosterVersion('${v.id}')" class="px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-[10px] font-black">載入</button>
+                        <button type="button" onclick="window.deletePatrolRosterVersion('${v.id}')" class="p-1 text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                    </div>
+                </div>`).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        /* ====== 可管理樓層清單：全部 + 各樓層皆可新增、改名、刪除、調整順序 ====== */
+        function seedPatrolFloors() {
+            const out = [];
+            ['地下', '一樓', '二樓'].forEach(f => { if (patrolRoster.some(s => s.floor === f) && out.indexOf(f) === -1) out.push(f); });
+            patrolRoster.forEach(s => { if (s.floor && out.indexOf(s.floor) === -1) out.push(s.floor); });
+            return out.length ? out : ['地下', '一樓', '二樓'];
+        }
+        let patrolFloors = getLocal('work_cache_patrol_floors', null);
+        if (!Array.isArray(patrolFloors) || !patrolFloors.length || savedRosterVer < BUILTIN_ROSTER_VERSION) {
+            patrolFloors = seedPatrolFloors();
+            safeSetLocal('work_cache_patrol_floors', patrolFloors);
+        } else {
+            patrolFloors = patrolFloors.filter(f => typeof f === 'string' && f.trim().length);
+        }
+        window.patrolFloors = patrolFloors;
+
+        window.getPatrolFloorList = () => ['ALL', ...patrolFloors];
+
+        window.savePatrolFloors = () => {
+            safeSetLocal('work_cache_patrol_floors', patrolFloors);
+            if (window.syncConfig) window.syncConfig('patrol_floors', { floors: patrolFloors, ver: BUILTIN_ROSTER_VERSION });
+            if (patrolFloor !== 'ALL' && patrolFloors.indexOf(patrolFloor) === -1) patrolFloor = 'ALL';
+            if (window.renderPatrolFloorSlider) window.renderPatrolFloorSlider();
+            if (window.renderPatrolRosterFloorSelect) window.renderPatrolRosterFloorSelect();
+            if (window.renderFloorManager) window.renderFloorManager();
+            if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+        };
+
+        // 動態生成樓層滑動軌道（按鈕 + 滑塊等份寬度）
+        window.renderPatrolFloorSlider = () => {
+            const track = $('floorSliderTrack'); if (!track) return;
+            const list = window.getPatrolFloorList();
+            const n = list.length;
+            const thumb = $('floorSliderThumb');
+            if (thumb) {
+                thumb.style.width = (100 / n) + '%';
+                const idx = list.indexOf(patrolFloor);
+                thumb.style.transform = `translateX(${Math.max(0, idx) * 100}%)`;
+            }
+            track.querySelectorAll('button[data-floor]').forEach(b => b.remove());
+            list.forEach((f, idx) => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.dataset.floor = f;
+                b.id = 'patrol-flt-' + idx;
+                b.onclick = () => window.filterPatrolFloor(f);
+                b.textContent = f === 'ALL' ? '全部' : f;
+                const sel = patrolFloor === f;
+                b.className = 'relative z-10 flex-1 text-center text-[12.5px] leading-none py-1 flex items-center justify-center pointer-events-auto transition-colors duration-200 ' + (sel ? 'font-black text-white' : 'font-bold text-slate-600 hover:text-slate-900');
+                track.appendChild(b);
+            });
+        };
+
+        // 名冊管理「新增攤位」的樓層下拉 → 改讀可管理樓層清單
+        window.renderPatrolRosterFloorSelect = () => {
+            const sel = $('prNewFloor'); if (!sel) return;
+            sel.innerHTML = patrolFloors.map(f => `<option>${prEsc(f)}</option>`).join('');
+        };
+
+        // ---- 樓層管理彈窗 ----
+        window.openFloorManageModal = () => {
+            const m = $('floorManageModal'); if (!m) return;
+            m.classList.replace('hidden', 'flex');
+            if (window.renderFloorManager) window.renderFloorManager();
+        };
+        window.closeFloorManageModal = () => { const m = $('floorManageModal'); if (m) m.classList.replace('flex', 'hidden'); };
+
+        window.renderFloorManager = () => {
+            const list = $('floorManageList'); if (!list) return;
+            if (!patrolFloors.length) {
+                list.innerHTML = '<p class="text-xs text-slate-400 text-center py-3">尚無樓層。用下方「＋新增樓層」建立第一個。</p>';
+                return;
+            }
+            list.innerHTML = patrolFloors.map((f, i) => {
+                const count = patrolRoster.filter(s => s.floor === f).length;
+                return `
+                <div class="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5">
+                    <input type="color" value="${prEsc(patrolFloorColors[f] || '#64748b')}" onchange="window.setFloorColor('${prEsc(f)}', this.value)" class="w-7 h-7 rounded-md border border-slate-200 p-0.5 cursor-pointer shrink-0 bg-transparent" title="此樓層底色（巡查卡片標籤）">
+                    <input value="${prEsc(f)}" class="flex-1 min-w-0 bg-white border border-slate-200 rounded-md px-1.5 py-1 text-[12px] font-bold focus:border-blue-500 focus:outline-none" onchange="window.renameFloor(${i}, this.value)">
+                    <span class="text-[10px] text-slate-400 shrink-0">${count} 檔</span>
+                    <div class="flex items-center gap-0.5 shrink-0">
+                        <button type="button" onclick="window.moveFloor(${i}, -1)" class="p-1 text-slate-400 hover:text-blue-600"><i data-lucide="chevron-up" class="w-3.5 h-3.5"></i></button>
+                        <button type="button" onclick="window.moveFloor(${i}, 1)" class="p-1 text-slate-400 hover:text-blue-600"><i data-lucide="chevron-down" class="w-3.5 h-3.5"></i></button>
+                        <button type="button" onclick="window.removeFloor(${i})" class="p-1 text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                    </div>
+                </div>`;
+            }).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.addFloorFromInput = () => {
+            const name = ($('newFloorName')?.value || '').trim();
+            if (!name) { window.showToast('請輸入樓層名稱', true); return; }
+            if (patrolFloors.some(f => f.toLowerCase() === name.toLowerCase())) { window.showToast('此樓層已存在', true); return; }
+            patrolFloors.push(name);
+            if ($('newFloorName')) $('newFloorName').value = '';
+            window.savePatrolFloors();
+            window.showToast('✅ 已新增樓層「' + name + '」');
+        };
+        window.renameFloor = (i, newName) => {
+            const oldName = patrolFloors[i];
+            const name = (newName || '').trim();
+            if (!name || oldName === name) { if (window.renderFloorManager) window.renderFloorManager(); return; }
+            if (patrolFloors.some((f, j) => j !== i && f.toLowerCase() === name.toLowerCase())) {
+                window.showToast('此樓層名稱已存在', true);
+                if (window.renderFloorManager) window.renderFloorManager();
+                return;
+            }
+            patrolFloors[i] = name;
+            if (typeof patrolFloorColors !== 'undefined') {
+                if (patrolFloorColors[oldName]) { patrolFloorColors[name] = patrolFloorColors[oldName]; delete patrolFloorColors[oldName]; }
+                else patrolFloorColors[name] = window.getPatrolFloorColor(name);
+                window.savePatrolFloorColors();
+            }
+            let changed = 0;
+            patrolRoster.forEach(s => { if (s.floor === oldName) { s.floor = name; changed++; } });
+            if (patrolFloor === oldName) patrolFloor = name;
+            window.savePatrolFloors();
+            window.savePatrolRoster();
+            window.showToast(`✅ 已更名「${oldName}」→「${name}」${changed ? `，並同步更新 ${changed} 檔攤位` : ''}`);
+        };
+        window.moveFloor = (i, dir) => {
+            const j = i + dir;
+            if (j < 0 || j >= patrolFloors.length) return;
+            const t = patrolFloors[i]; patrolFloors[i] = patrolFloors[j]; patrolFloors[j] = t;
+            window.savePatrolFloors();
+        };
+        window.removeFloor = (i) => {
+            const name = patrolFloors[i];
+            const count = patrolRoster.filter(s => s.floor === name).length;
+            const extra = count ? `（內含 ${count} 檔攤位，將一併從巡查名冊刪除）` : '';
+            window.showConfirm('刪除樓層', `確定刪除樓層「${name}」${extra}？`, () => {
+                patrolFloors.splice(i, 1);
+                patrolRoster = patrolRoster.filter(s => s.floor !== name);
+                if (patrolFloor === name) patrolFloor = 'ALL';
+                if (typeof patrolFloorColors !== 'undefined') { delete patrolFloorColors[name]; window.savePatrolFloorColors(); }
+                window.savePatrolFloors();
+                window.savePatrolRoster();
+                window.showToast('✅ 已刪除樓層「' + name + '」');
+            });
+        };
+
+        /* ====== 樓層底色（巡查卡片色塊標籤用，各層可自訂） ====== */
+        const FLOOR_COLOR_PALETTE = ['#7c3aed','#db2777','#059669','#d97706','#dc2626','#4f46e5','#0891b2','#a21caf','#65a30d','#c2410c'];
+        const DFLT_FLOOR_COLORS = { '地下': '#0e7490', '一樓': '#ea580c', '二樓': '#d97706' };
+        let patrolFloorColors = getLocal('work_cache_patrol_floor_colors', null);
+        if (!patrolFloorColors || typeof patrolFloorColors !== 'object' || Array.isArray(patrolFloorColors)) patrolFloorColors = {};
+        if (savedRosterVer < BUILTIN_ROSTER_VERSION) {
+            // 名冊版本升級：清除舊樓層色，改用新樓層預設色
+            patrolFloorColors = {};
+        }
+        Object.keys(DFLT_FLOOR_COLORS).forEach(k => { if (!patrolFloorColors[k]) patrolFloorColors[k] = DFLT_FLOOR_COLORS[k]; });
+        window.patrolFloorColors = patrolFloorColors;
+
+        window.savePatrolFloorColors = () => {
+            safeSetLocal('work_cache_patrol_floor_colors', patrolFloorColors);
+            if (window.syncConfig) window.syncConfig('patrol_floor_colors', { colors: patrolFloorColors });
+            if (window.renderFloorManager) window.renderFloorManager();
+        };
+        window.getPatrolFloorColor = (floor) => {
+            if (!floor || floor === 'ALL') return '#64748b';
+            if (patrolFloorColors[floor]) return patrolFloorColors[floor];
+            const used = Object.values(patrolFloorColors);
+            const free = FLOOR_COLOR_PALETTE.find(c => used.indexOf(c) === -1);
+            patrolFloorColors[floor] = free || '#64748b';
+            window.savePatrolFloorColors();
+            return patrolFloorColors[floor];
+        };
+        window.floorLabelTextColor = (bg) => {
+            const c = String(bg || '#64748b').replace('#', '');
+            const r = parseInt(c.substr(0,2),16) || 0, g = parseInt(c.substr(2,2),16) || 0, b = parseInt(c.substr(4,2),16) || 0;
+            const lum = 0.299*r + 0.587*g + 0.114*b;
+            return lum > 175 ? '#1f2937' : '#ffffff';
+        };
+        window.setFloorColor = (floor, color) => {
+            patrolFloorColors[floor] = color;
+            window.savePatrolFloorColors();
+            if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+        };
 
         // ====== 1. 香港時區 (UTC+8) 與巡查日期/時段核心初始化（確保在溫度與剔檔模組前完成定義） ======
         window.formatDateStrHK = (msOrDate) => {
@@ -3755,7 +4347,7 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
             const [phH, phM] = photoTime.split(':').map(Number);
             const photoMins = (isNaN(phH) ? 12 : phH) * 60 + (isNaN(phM) ? 0 : phM);
 
-            const matchedStalls = RAW_PATROL_STALLS.filter(s => {
+            const matchedStalls = patrolRoster.filter(s => {
                 const sId = s.id.trim();
                 if (title.toUpperCase() === sId.toUpperCase()) return true;
                 let titlePrefix = '';
@@ -4291,52 +4883,48 @@ window.clearTodayPatrolData = (e) => {
             patrolFocusIndex = 0;
             window.clearFocusAutoTimer();
 
-            // 4 個項目對應座標
-            const mapKeys = {
-                'ALL': { id: 'all', idx: 0 },
-                '花園仔': { id: 'garden', idx: 1 },
-                '地下': { id: 'fish', idx: 2 },
-                '一樓': { id: 'first', idx: 3 }
-            };
-
-            const target = mapKeys[flr] || mapKeys['ALL'];
+            const list = window.getPatrolFloorList ? window.getPatrolFloorList() : ['ALL', ...patrolFloors];
+            const targetIdx = list.indexOf(flr);
+            const idx = targetIdx === -1 ? 0 : targetIdx;
 
             // 🌟 採用硬體加速平滑滑動位移（每次精準平移 100% 格寬）
             const thumb = $('floorSliderThumb');
             if (thumb) {
-                thumb.style.transform = `translateX(${target.idx * 100}%)`;
+                thumb.style.transform = `translateX(${idx * 100}%)`;
             }
 
-            ['all', 'garden', 'fish', 'first'].forEach(f => {
-                const btn = $(`patrol-flt-${f}`);
-                if (btn) {
-                    const isSelected = (f === target.id);
-                    btn.className = isSelected
+            const track = $('floorSliderTrack');
+            if (track) {
+                track.querySelectorAll('button[data-floor]').forEach(b => {
+                    const isSelected = b.dataset.floor === flr;
+                    b.className = isSelected
                         ? "relative z-10 flex-1 text-center text-[12.5px] font-black text-white transition-colors duration-200 leading-none py-1 flex items-center justify-center pointer-events-auto"
                         : "relative z-10 flex-1 text-center text-[12.5px] font-bold text-slate-600 hover:text-slate-900 transition-colors duration-200 leading-none py-1 flex items-center justify-center pointer-events-auto";
-                }
-            });
+                });
+            }
 
             window.renderPatrol();
         };
 
-        // 🌟 支援手指在軌道上「直接滑動/拖曳」手勢
+        // 🌟 支援手指在軌道上「直接滑動/拖曳」手勢（動態讀取目前樓層清單）
         (function initFloorSliderTouchSwipe() {
             const bindTrackSwipe = () => {
                 const track = $('floorSliderTrack');
                 if (!track || track._swipeBound) return;
                 track._swipeBound = true;
-                const floors = ['ALL', '花園仔', '地下', '一樓'];
 
                 const handleSwipe = (e) => {
                     const touch = e.touches ? e.touches[0] : e;
                     if (!touch) return;
                     const rect = track.getBoundingClientRect();
+                    if (!rect.width) return;
+                    const list = window.getPatrolFloorList ? window.getPatrolFloorList() : ['ALL', ...patrolFloors];
+                    const n = list.length;
                     const offsetX = touch.clientX - rect.left;
-                    let idx = Math.floor((offsetX / rect.width) * 4);
-                    idx = Math.max(0, Math.min(3, idx));
-                    if (floors[idx] && patrolFloor !== floors[idx]) {
-                        window.filterPatrolFloor(floors[idx]);
+                    let idx = Math.floor((offsetX / rect.width) * n);
+                    idx = Math.max(0, Math.min(n - 1, idx));
+                    if (list[idx] && patrolFloor !== list[idx]) {
+                        window.filterPatrolFloor(list[idx]);
                     }
                 };
 
@@ -4403,12 +4991,12 @@ window.clearTodayPatrolData = (e) => {
         };
 
         window.getFilteredPatrolStalls = () => {
-            if (patrolFloor === 'ALL') return RAW_PATROL_STALLS;
-            return RAW_PATROL_STALLS.filter(s => s.floor === patrolFloor);
+            if (patrolFloor === 'ALL') return patrolRoster;
+            return patrolRoster.filter(s => s.floor === patrolFloor);
         };
 
         window.openPatrolFilledList = () => {
-            const stalls = window.getFilteredPatrolStalls ? window.getFilteredPatrolStalls() : RAW_PATROL_STALLS;
+            const stalls = window.getFilteredPatrolStalls ? window.getFilteredPatrolStalls() : patrolRoster;
             const filled = stalls.filter(s => window.getPatrolStatus(s, patrolSlot));
             const list = $('patrolFilledList');
             const label = $('patrolFilledSlotLabel');
@@ -4560,7 +5148,8 @@ window.clearTodayPatrolData = (e) => {
                                 ${genderTagScaled}
                             </div>
                             <div class="flex items-center gap-1.5 min-w-0">
-                                <span class="${S.sub} text-slate-500 font-bold truncate shrink-0">${stall.floor} · ${stall.type}</span>
+                                <span class="rounded px-1.5 py-0.5 font-black leading-none shrink-0 shadow-xs" style="background:${window.getPatrolFloorColor(stall.floor)};color:${window.floorLabelTextColor(window.getPatrolFloorColor(stall.floor))}">${stall.floor}</span>
+                                <span class="${S.sub} text-slate-500 font-bold truncate shrink-0">${stall.type}</span>
                                 <span class="${S.name} font-black text-slate-900 truncate">${stall.name || '無'}</span>
                             </div>
                         </div>
@@ -4588,7 +5177,10 @@ window.clearTodayPatrolData = (e) => {
                             ${genderTagScaled}
                             <span class="${S.name} font-black text-slate-900 truncate ml-0.5">${stall.name || '無'}</span>
                         </div>
-                        <div class="${S.sub} text-slate-500 font-bold truncate pl-0.5">${stall.floor} · ${stall.type}</div>
+                        <div class="flex items-center ${S.sub} gap-1.5 pl-0.5 min-w-0">
+                            <span class="rounded px-1.5 py-0.5 font-black leading-none shrink-0 shadow-xs" style="background:${window.getPatrolFloorColor(stall.floor)};color:${window.floorLabelTextColor(window.getPatrolFloorColor(stall.floor))}">${stall.floor}</span>
+                            <span class="text-slate-500 font-bold truncate">${stall.type}</span>
+                        </div>
                     </div>
                     <div class="flex items-center gap-1.5 shrink-0">
                         <div class="flex items-center">${statusBadgeScaled}</div>
@@ -4661,7 +5253,7 @@ window.clearTodayPatrolData = (e) => {
             const q = (queryStr || '').trim().toLowerCase();
             const cleanQ = q.replace(/^[a-z0-9]-?/i, '').replace(/^0+/, '');
 
-            const results = RAW_PATROL_STALLS.filter(s => {
+            const results = patrolRoster.filter(s => {
                 if (!q) return true;
                 const idLower = s.id.toLowerCase();
                 const pureNum = s.id.replace(/^[a-z0-9]-?/i, '').replace(/^0+/, '');
@@ -4736,7 +5328,7 @@ window.clearTodayPatrolData = (e) => {
                 ['巡查日期', currentPatrolDate],
                 ['樓層', '攤位編號', '售賣種類', '承租人姓名', '性別', '上午9點', '上午11點', '下午4點', '下午6點']
             ];
-            RAW_PATROL_STALLS.forEach(s => {
+            patrolRoster.forEach(s => {
                 const k = window.getPatrolKey(s);
                 const d = currentRecords[k] || {};
                 patrolRows.push([
@@ -5096,7 +5688,236 @@ window.crNotifiedSet = new Set(JSON.parse(sessionStorage.getItem('work_cr_notifi
                 modal.classList.replace('flex', 'hidden');
                 if (typeof onConfirm === 'function') onConfirm();
             };
-            lucide.createIcons(); modal.classList.replace('hidden', 'flex');
+            if (window.lucide) lucide.createIcons(); modal.classList.replace('hidden', 'flex');
+        };
+
+        /* ====== 成員排更（員工×日期更表，格式對照官方更表 Excel；可自行增刪改成員） ====== */
+        const SCHED_SEED_MEMBERS = [
+            { id: 'CS022-2', name: '劉翠翠' }, { id: 'CS025', name: '黃杏慈' },
+            { id: 'CS027', name: '譚文輝' }, { id: 'CS004-1', name: '廖麗環' },
+            { id: 'CS040-1', name: '鄭輝曄' }, { id: 'CS059', name: '黃梓洋' },
+            { id: 'CS032-2', name: '洪莉莉' }, { id: 'CS038-2', name: '容展能' },
+            { id: 'CS002', name: '張佳玉' }, { id: 'CS021', name: '文小彤' },
+            { id: 'CS013-2', name: '郭小紅' },
+        ];
+        const SCHED_MARKS = [['1','全日'],['0.5','半日'],['假','假'],['補假','補假'],['周休','周休'],['培訓','培訓'],['面試','面試']];
+        let schedMembers = getLocal('work_cache_sched_members', null);
+        if (!Array.isArray(schedMembers) || !schedMembers.length) {
+            schedMembers = JSON.parse(JSON.stringify(SCHED_SEED_MEMBERS));
+            safeSetLocal('work_cache_sched_members', schedMembers);
+        }
+        let schedData = getLocal('work_cache_sched_data', {});
+        if (!schedData || typeof schedData !== 'object' || Array.isArray(schedData)) schedData = {};
+        window.schedMembers = schedMembers;
+        window.schedData = schedData;
+        let schedYear = (new Date()).getFullYear();
+        let schedMonth = (new Date()).getMonth() + 1;
+
+        window.saveSchedAll = () => {
+            safeSetLocal('work_cache_sched_members', schedMembers);
+            safeSetLocal('work_cache_sched_data', schedData);
+            if (window.syncConfig) { window.syncConfig('sched_members', { members: schedMembers }); window.syncConfig('sched_data', { data: schedData }); }
+            window.showToast('✅ 已儲存排更');
+        };
+
+        const schedHrs = (on, off, mark) => {
+            if (!on || !off) return 0;
+            const p1 = on.split(':').map(Number), p2 = off.split(':').map(Number);
+            if (p1.length < 2 || p2.length < 2 || p1.some(Number.isNaN) || p2.some(Number.isNaN)) return 0;
+            let diff = (p2[0] + p2[1] / 60) - (p1[0] + p1[1] / 60);
+            if (diff < 0) diff += 24;
+            if (mark === '0.5') diff = diff / 2;
+            return Math.round(diff * 10) / 10;
+        };
+        const schedKey = () => `${schedYear}-${String(schedMonth).padStart(2, '0')}`;
+        const schedMonthData = () => { const k = schedKey(); if (!schedData[k]) schedData[k] = {}; return schedData[k]; };
+        const schedMemberRow = (id) => { const md = schedMonthData(); if (!md[id]) md[id] = {}; return md[id]; };
+
+        window.changeSchedMonth = (delta) => {
+            let mm = schedMonth + delta, yy = schedYear;
+            if (mm < 1) { mm = 12; yy--; } else if (mm > 12) { mm = 1; yy++; }
+            schedMonth = mm; schedYear = yy;
+            window.renderSched();
+        };
+        window.changeSchedMonthToNow = () => { schedYear = (new Date()).getFullYear(); schedMonth = (new Date()).getMonth() + 1; window.renderSched(); };
+
+        // 手動打入時間（小時制/24小時制）：支援 07:30、7:30、730、7（=07:00）、7.5（=07:30）… 自動正規化為 HH:MM
+        const normSchedTime = (v) => {
+            if (v === undefined || v === null) return '';
+            v = String(v).trim();
+            if (!v) return '';
+            if (/^\d{1,2}:\d{2}$/.test(v)) { const [h, m] = v.split(':'); const hn = +h, mn = +m; if (hn > 23 || mn > 59) return ''; return `${String(hn).padStart(2, '0')}:${String(mn).padStart(2, '0')}`; }
+            if (/^\d+(\.\d+)?$/.test(v)) {
+                const n = parseFloat(v);
+                if (Number.isNaN(n) || n < 0 || n > 24) return '';
+                let hh = Math.floor(n), mm = Math.round((n - hh) * 60);
+                if (mm === 60) { hh++; mm = 0; }
+                if (hh > 23) return '';
+                return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+            }
+            if (/^\d{1,4}$/.test(v)) {
+                let s = v;
+                if (s.length <= 2) return `${String(+s).padStart(2, '0')}:00`;
+                if (s.length === 3) s = '0' + s;
+                const hh = +s.slice(0, 2), mm = +s.slice(2);
+                if (hh > 23 || mm > 59) return '';
+                return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+            }
+            return '';
+        };
+        window.setSchedTime = (id, d, field, val) => {
+            const norm = normSchedTime(val);
+            const row = schedMemberRow(id);
+            if (!row[d]) row[d] = {};
+            row[d][field] = norm;
+            safeSetLocal('work_cache_sched_data', schedData);
+            if (window.syncConfig) window.syncConfig('sched_data', { data: schedData });
+            window.renderSched();
+        };
+
+        // 大畫面字級縮放（A−/A+）：整體放大縮小排更表
+        let schedFontScale = getLocal('work_cache_sched_font_scale', 1);
+        window.schedZoomIn = () => { schedFontScale = Math.min(1.6, +(schedFontScale + 0.15).toFixed(2)); window.renderSched(); };
+        window.schedZoomOut = () => { schedFontScale = Math.max(0.7, +(schedFontScale - 0.15).toFixed(2)); window.renderSched(); };
+        window.schedZoomReset = () => { schedFontScale = 1; window.renderSched(); };
+
+        window.renderSched = () => {
+            if (!$('schedMonthTitle') || !$('schedThead')) return;
+            safeSetLocal('work_cache_sched_font_scale', schedFontScale);
+            $('schedMonthTitle').textContent = `${schedYear}年${schedMonth}月`;
+            const FZ = Math.max(10, Math.round(11 * schedFontScale));       // 主字級
+            const FZS = Math.max(8, Math.round(FZ * 0.8));                  // 小字（星期/時數/編號）
+            const nameW = Math.round(92 * schedFontScale);                  // 姓名欄寬
+            const timeW = Math.round(58 * schedFontScale);                  // 時間格寬
+            const statW = Math.round(48 * schedFontScale);                  // 統計欄寬
+            const n = new Date(); const nowY = n.getFullYear(), nowM = n.getMonth() + 1, nowD = n.getDate();
+            const days = new Date(schedYear, schedMonth, 0).getDate();
+            const md = schedMonthData();
+            // 表頭
+            let th = `<tr><th rowspan="2" class="sticky left-0 z-30 bg-white border border-slate-200 px-2 py-1.5 text-slate-600 font-black text-center min-w-[${nameW}px]" style="font-size:${FZ}px">編號／姓名</th>`;
+            for (let d = 1; d <= days; d++) {
+                const wd = ['日','一','二','三','四','五','六'][new Date(schedYear, schedMonth - 1, d).getDay()];
+                const today = (schedYear === nowY && schedMonth === nowM && d === nowD);
+                th += `<th class="border border-slate-200 px-0 py-0.5 text-center ${today ? 'bg-amber-100' : 'bg-slate-50'}"><div class="font-black ${wd === '日' ? 'text-rose-500' : 'text-slate-600'}" style="font-size:${FZ}px">${d}</div><div style="font-size:${FZS}px" class="text-slate-400">${wd}</div></th>`;
+            }
+            th += `<th rowspan="2" class="bg-slate-50 border border-slate-200 px-2 py-1.5 text-center text-slate-600 font-black min-w-[${statW}px]" style="font-size:${FZ}px">月總時數</th>`;
+            th += `<th rowspan="2" class="bg-slate-50 border border-slate-200 px-2 py-1.5 text-center text-slate-500 font-bold min-w-[${Math.round(statW*0.86)}px]" style="font-size:${FZ}px">病假</th>`;
+            th += `<th rowspan="2" class="bg-slate-50 border border-slate-200 px-2 py-1.5 text-center text-slate-500 font-bold min-w-[${Math.round(statW*0.86)}px]" style="font-size:${FZ}px">年假</th>`;
+            th += `<th rowspan="2" class="bg-slate-50 border border-slate-200 px-2 py-1.5 text-center text-slate-500 font-bold min-w-[${Math.round(statW*0.86)}px]" style="font-size:${FZ}px">加班</th>`;
+            $('schedThead').innerHTML = th;
+            // 表體
+            let tb = '';
+            schedMembers.forEach((m) => {
+                const row = md[m.id] || (md[m.id] = {});
+                let monthTotal = 0, cells = '';
+                for (let d = 1; d <= days; d++) {
+                    const c = row[d] || {};
+                    const h = schedHrs(c.on, c.off, c.mark);
+                    monthTotal += h;
+                    const markOpts = '<option value=""' + (!c.mark ? ' selected' : '') + '></option>' +
+                        SCHED_MARKS.map(([v, label]) => `<option value="${v}"${c.mark === v ? ' selected' : ''}>${label}</option>`).join('');
+                    cells += `<td class="border border-slate-200 p-0 text-center align-top">
+                        <div class="flex items-center justify-center gap-0.5 px-0.5">
+                            <input type="text" inputmode="numeric" value="${prEsc(c.on)}" placeholder="07:30" onchange="window.setSchedTime('${prEsc(m.id)}',${d},'on',this.value)" title="上班時間（手動打入，例 07:30 / 730 / 7.5）" class="w-[${timeW}px] bg-transparent text-center font-bold py-0.5 focus:outline-none focus:bg-amber-50" style="font-size:${FZ}px">
+                            <span class="text-slate-300" style="font-size:${FZS}px">/</span>
+                            <input type="text" inputmode="numeric" value="${prEsc(c.off)}" placeholder="18:30" onchange="window.setSchedTime('${prEsc(m.id)}',${d},'off',this.value)" title="下班時間（手動打入）" class="w-[${timeW}px] bg-transparent text-center font-bold py-0.5 focus:outline-none focus:bg-amber-50" style="font-size:${FZ}px">
+                        </div>
+                        <div class="flex items-center justify-center px-0.5 pb-0.5">
+                            <select onchange="window.setSchedField('${prEsc(m.id)}',${d},'mark',this.value)" class="bg-slate-50 border border-slate-100 rounded font-bold py-0.5 max-w-[${Math.round(64*schedFontScale)}px]" style="font-size:${FZS}px">${markOpts}</select>
+                            <span class="text-slate-400 ml-1" style="font-size:${FZS}px">${h ? h + 'h' : ''}</span>
+                        </div>
+                    </td>`;
+                }
+                const st = row.__stats || {};
+                tb += `<tr class="bg-white">
+                    <td class="sticky left-0 z-20 bg-white border border-slate-200 px-2 py-1"><div class="font-black text-slate-700" style="font-size:${FZ}px">${prEsc(m.name)}</div><div style="font-size:${FZS}px" class="text-slate-400">${prEsc(m.id)}</div></td>
+                    ${cells}
+                    <td class="border border-slate-200 px-2 py-1 text-center font-black text-teal-700 whitespace-nowrap" style="font-size:${FZ}px">${monthTotal ? monthTotal + 'h' : ''}</td>
+                    <td class="border border-slate-200 px-1 py-1 text-center"><input type="number" min="0" value="${st.sick ?? ''}" onchange="window.setSchedStats('${prEsc(m.id)}','sick',this.value)" class="w-9 bg-transparent text-center font-bold focus:outline-none focus:bg-amber-50" style="font-size:${FZ}px" title="病假"></td>
+                    <td class="border border-slate-200 px-1 py-1 text-center"><input type="number" min="0" value="${st.annual ?? ''}" onchange="window.setSchedStats('${prEsc(m.id)}','annual',this.value)" class="w-9 bg-transparent text-center font-bold focus:outline-none focus:bg-amber-50" style="font-size:${FZ}px" title="年假"></td>
+                    <td class="border border-slate-200 px-1 py-1 text-center"><input type="number" min="0" value="${st.ot ?? ''}" onchange="window.setSchedStats('${prEsc(m.id)}','ot',this.value)" class="w-9 bg-transparent text-center font-bold focus:outline-none focus:bg-amber-50" style="font-size:${FZ}px" title="加班時數"></td>
+                </tr>`;
+            });
+            if (!schedMembers.length) tb = '<tr><td colspan="' + (days + 5) + '" class="text-center text-slate-400 text-xs py-10">尚未有成員，請按右上「編輯名單」新增</td></tr>';
+            $('schedTbody').innerHTML = tb;
+            // 表尾：日合計
+            let totalAll = 0, foot = `<tr><td class="sticky left-0 z-20 bg-slate-50 border border-slate-200 px-2 py-1 font-black text-slate-500 text-center" style="font-size:${FZS}px">日合計</td>`;
+            for (let d = 1; d <= days; d++) {
+                let sum = 0;
+                schedMembers.forEach(m => { const c = (md[m.id] || {})[d] || {}; sum += schedHrs(c.on, c.off, c.mark); });
+                totalAll += sum;
+                foot += `<td class="border border-slate-200 px-1 py-0.5 text-center font-bold text-slate-500 bg-slate-50" style="font-size:${FZS}px">${sum ? sum + 'h' : ''}</td>`;
+            }
+            foot += '<td class="bg-slate-50 border border-slate-200" colspan="4"></td>';
+            $('schedTfoot').innerHTML = foot;
+            $('schedMonthSummary').textContent = `本月總時數 ${Math.round(totalAll * 10) / 10}h ｜ 成員 ${schedMembers.length} 人`;
+        };
+
+        window.setSchedField = (id, d, field, val) => {
+            const row = schedMemberRow(id);
+            if (!row[d]) row[d] = {};
+            row[d][field] = val;
+            safeSetLocal('work_cache_sched_data', schedData);
+            window.renderSched();
+        };
+        window.setSchedStats = (id, field, val) => {
+            const row = schedMemberRow(id);
+            if (!row.__stats) row.__stats = {};
+            row.__stats[field] = val;
+            safeSetLocal('work_cache_sched_data', schedData);
+            window.renderSched();
+        };
+
+        // —— 名單管理 ——
+        window.openSchedMemberModal = () => { $('schedMemberModal').classList.replace('hidden', 'flex'); window.renderSchedMemberList(); if (window.lucide) lucide.createIcons(); };
+        window.closeSchedMemberModal = () => $('schedMemberModal').classList.replace('flex', 'hidden');
+        window.renderSchedMemberList = () => {
+            const c = $('schedMemberList'); if (!c) return;
+            c.innerHTML = schedMembers.map((m, i) => `
+                <div class="flex items-center gap-1.5 bg-white border border-slate-200 rounded-xl p-1.5">
+                    <input value="${prEsc(m.id)}" onchange="window.updateSchedMemberId(${i},this.value)" placeholder="編號" class="flex-1 bg-slate-50 border border-slate-200 rounded-md px-1.5 py-1 text-[11px] font-bold focus:border-teal-500 focus:outline-none min-w-0">
+                    <input value="${prEsc(m.name)}" onchange="window.updateSchedMemberName(${i},this.value)" placeholder="姓名" class="flex-1 bg-slate-50 border border-slate-200 rounded-md px-1.5 py-1 text-[11px] font-bold focus:border-teal-500 focus:outline-none min-w-0">
+                    <button type="button" onclick="window.removeSchedMember(${i})" class="p-1.5 rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100 active:scale-95 shrink-0" title="移除"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                </div>`).join('') || '<div class="text-center text-slate-400 text-xs py-6">尚無成員，請在上方新增</div>';
+            if (window.lucide) lucide.createIcons();
+        };
+        window.addSchedMember = () => {
+            const id = ($('smNewId').value || '').trim(), name = ($('smNewName').value || '').trim();
+            if (!id) { window.showToast('請輸入編號', true); return; }
+            if (!name) { window.showToast('請輸入姓名', true); return; }
+            if (schedMembers.some(m => m.id === id)) { window.showToast('編號已存在', true); return; }
+            schedMembers.push({ id, name });
+            safeSetLocal('work_cache_sched_members', schedMembers);
+            if (window.syncConfig) window.syncConfig('sched_members', { members: schedMembers });
+            $('smNewId').value = ''; $('smNewName').value = '';
+            window.renderSchedMemberList(); window.renderSched();
+            window.showToast(`✅ 已新增 ${name}`);
+        };
+        window.updateSchedMemberId = (i, val) => {
+            if (!schedMembers[i]) return;
+            const old = schedMembers[i].id, neu = val.trim();
+            if (neu && schedMembers.some((m, x) => x !== i && m.id === neu)) { window.showToast('編號重複，未改動', true); window.renderSchedMemberList(); return; }
+            if (neu && neu !== old) {
+                const k = schedKey();
+                if (schedData[k] && schedData[k][old]) { schedData[k][neu] = schedData[k][old]; delete schedData[k][old]; }
+            }
+            schedMembers[i].id = neu || old;
+            safeSetLocal('work_cache_sched_members', schedMembers);
+            safeSetLocal('work_cache_sched_data', schedData);
+        };
+        window.updateSchedMemberName = (i, val) => { if (schedMembers[i]) { schedMembers[i].name = val.trim(); safeSetLocal('work_cache_sched_members', schedMembers); } };
+        window.removeSchedMember = (i) => {
+            const m = schedMembers[i]; if (!m) return;
+            window.showConfirm('移除成員', `確定移除「${m.name}（${m.id}）」並清空其排更資料嗎？`, () => {
+                schedMembers.splice(i, 1);
+                const k = schedKey();
+                if (schedData[k]) delete schedData[k][m.id];
+                safeSetLocal('work_cache_sched_members', schedMembers);
+                safeSetLocal('work_cache_sched_data', schedData);
+                if (window.syncConfig) { window.syncConfig('sched_members', { members: schedMembers }); window.syncConfig('sched_data', { data: schedData }); }
+                window.renderSchedMemberList(); window.renderSched();
+                window.showToast('🗑️ 已移除成員');
+            });
         };
 
         window.setUploadProgress = (percent, text) => {
@@ -7785,6 +8606,85 @@ window.autoSyncClosedStallsToPatrol(true); // 🌟 立即更新剔檔
                 }
             });
             bindSync('future_memos', 'work_cache_future_memos', d => { futureMemos = d.memos || []; if (!$('memoPage')?.classList.contains('hidden')) window.renderMemos(); window.checkMemoAlerts(); });
+
+            // 🌟 自訂分頁（定義與記錄）跨裝置即時同步
+            bindSync('custom_tabs', 'work_cache_custom_tabs', d => {
+                if (d && Array.isArray(d.tabs)) {
+                    customTabs = d.tabs;
+                    safeSetLocal('work_cache_custom_tabs', customTabs);
+                    ensureCustomTabsLoaded();
+                    window.applyTabVisibility();
+                }
+            });
+            bindSync('custom_tab_data', 'work_cache_custom_tab_data', d => {
+                if (d && d.data) {
+                    customTabData = d.data;
+                    safeSetLocal('work_cache_custom_tab_data', customTabData);
+                    if (window._currentCustomTabId) window.renderCustomTabPage(window._currentCustomTabId);
+                }
+            });
+
+            // 🌟 巡查名冊與版本（跨裝置即時同步，即時自行更改）
+            bindSync('patrol_roster', 'work_cache_patrol_roster', d => {
+                if (d && Array.isArray(d.roster) && d.roster.length) {
+                    // 雲端名冊版本防護：雲端若仍是舊體系資料，忽略之，避免覆蓋內建新名冊
+                    if (d.ver !== undefined && d.ver < BUILTIN_ROSTER_VERSION) return;
+                    patrolRoster = d.roster;
+                    window.patrolRoster = patrolRoster;
+                    safeSetLocal('work_cache_patrol_roster', patrolRoster);
+                    if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+                    if (window.renderPatrolRosterManager) window.renderPatrolRosterManager();
+                }
+            });
+            bindSync('patrol_roster_versions', 'work_cache_patrol_roster_versions', d => {
+                if (d && Array.isArray(d.versions)) {
+                    patrolRosterVersions = d.versions;
+                    window.patrolRosterVersions = patrolRosterVersions;
+                    safeSetLocal('work_cache_patrol_roster_versions', patrolRosterVersions);
+                    if (window.renderPatrolVersionsList) window.renderPatrolVersionsList();
+                }
+            });
+            bindSync('patrol_floors', 'work_cache_patrol_floors', d => {
+                if (d && Array.isArray(d.floors) && d.floors.length) {
+                    if (d.ver !== undefined && d.ver < BUILTIN_ROSTER_VERSION) return;
+                    patrolFloors = d.floors.filter(f => typeof f === 'string' && f.trim().length);
+                    window.patrolFloors = patrolFloors;
+                    safeSetLocal('work_cache_patrol_floors', patrolFloors);
+                    if (patrolFloor !== 'ALL' && patrolFloors.indexOf(patrolFloor) === -1) patrolFloor = 'ALL';
+                    if (window.renderPatrolFloorSlider) window.renderPatrolFloorSlider();
+                    if (window.renderPatrolRosterFloorSelect) window.renderPatrolRosterFloorSelect();
+                    if (window.renderFloorManager) window.renderFloorManager();
+                    if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+                }
+            });
+            bindSync('patrol_floor_colors', 'work_cache_patrol_floor_colors', d => {
+                if (d && d.colors && typeof d.colors === 'object') {
+                    patrolFloorColors = Object.assign({}, d.colors);
+                    window.patrolFloorColors = patrolFloorColors;
+                    safeSetLocal('work_cache_patrol_floor_colors', patrolFloorColors);
+                    if (window.renderFloorManager) window.renderFloorManager();
+                    if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+                }
+            });
+
+            // 🌟 成員排更雲端同步（名單＋每月更表資料跨裝置即時同步）
+            bindSync('sched_members', 'work_cache_sched_members', d => {
+                if (d && Array.isArray(d.members)) {
+                    schedMembers = d.members;
+                    window.schedMembers = schedMembers;
+                    safeSetLocal('work_cache_sched_members', schedMembers);
+                    if (window.renderSched) window.renderSched();
+                    if (window.renderSchedMemberList) window.renderSchedMemberList();
+                }
+            });
+            bindSync('sched_data', 'work_cache_sched_data', d => {
+                if (d && d.data && typeof d.data === 'object') {
+                    schedData = d.data;
+                    window.schedData = schedData;
+                    safeSetLocal('work_cache_sched_data', schedData);
+                    if (window.renderSched) window.renderSched();
+                }
+            });
 
             // 🌟 客服名單與 5 日排班雲端同步（包含多日字典多設備即時同步）
             bindSync('team_members', 'work_cache_team_members', d => {
@@ -11805,23 +12705,20 @@ window.crSaveData = () => {
                 memo: 'memoPage', 
                 map: 'mapPage', 
                 coldRoom: 'coldRoomPage', 
-                closing: 'closingPage' 
+                closing: 'closingPage',
+                sched: 'schedPage' 
             };
 
             const actCls = "flex-1 py-1.5 px-2 text-xs rounded-md bg-white text-blue-600 shadow-sm border border-[#d6d0c4] font-semibold transition-all uppercase tracking-widest text-center whitespace-nowrap";
             const inactCls = "flex-1 py-1.5 px-2 text-xs text-slate-500 hover:text-slate-700 transition-all uppercase tracking-widest text-center whitespace-nowrap";
             
-            // 🌟 關鍵修正第 1 步：先隱藏其他頁面，並立刻顯示目標頁面（移除 hidden）
+            // 🌟 關鍵修正第 1 步：先隱藏其他頁面與自訂分頁容器
             Object.values(pages).forEach(id => { 
                 const el = $(id); 
                 if (el) { el.classList.add('hidden'); el.classList.remove('flex', 'block'); } 
             });
-
-            const targetPage = $(pages[tab]);
-            if (targetPage) { 
-                targetPage.classList.remove('hidden'); 
-                                targetPage.classList.add(['map', 'gallery', 'coldRoom', 'closing'].includes(tab) ? 'flex' : 'block'); 
-            }
+            const custPage = $('customTabPage');
+            if (custPage) { custPage.classList.add('hidden'); custPage.classList.remove('flex', 'block'); }
 
             // 更新按鈕樣式
             tabOrderList.forEach(k => {
@@ -11831,20 +12728,33 @@ window.crSaveData = () => {
             const targetBtn = $(tabMetadataMap[tab]?.btnId);
             if (targetBtn) targetBtn.className = actCls;
 
-            // 🌟 關鍵修正第 2 步：頁面已經移除 hidden 後，才執行對應的渲染函式
-            ({
-                patrol: () => {
-                    window.applyAutoPatrolSlot(false); // 🌟 改為 false：保留使用者當前正在查看的時段，絕不擅自跳轉
-                    window.autoSyncClosedStallsToPatrol(true);
-                    window.setPatrolViewMode('card');
-                },
-                gallery: window.renderGallery,
-                timeline: () => window.renderTimeline(true),
-                memo: window.renderMemos,
-                map: window.renderMap,
-                coldRoom: window.crRenderList,
-                closing: () => { window.searchStall?.(); },
-            })[tab]?.();
+            // 🌟 自訂分頁：顯示通用內容區並渲染其記錄
+            const meta = tabMetadataMap[tab];
+            if (meta && meta.custom) {
+                if (custPage) { custPage.classList.remove('hidden'); custPage.classList.add('flex'); window.renderCustomTabPage(tab); }
+            } else {
+                const targetPage = $(pages[tab]);
+                if (targetPage) { 
+                    targetPage.classList.remove('hidden'); 
+                                    targetPage.classList.add(['map', 'gallery', 'coldRoom', 'closing'].includes(tab) ? 'flex' : 'block'); 
+                }
+
+                // 🌟 關鍵修正第 2 步：頁面已經移除 hidden 後，才執行對應的渲染函式
+                ({
+                    patrol: () => {
+                        window.applyAutoPatrolSlot(false); // 🌟 改為 false：保留使用者當前正在查看的時段，絕不擅自跳轉
+                        window.autoSyncClosedStallsToPatrol(true);
+                        window.setPatrolViewMode('card');
+                    },
+                    gallery: window.renderGallery,
+                    timeline: () => window.renderTimeline(true),
+                    memo: window.renderMemos,
+                    map: window.renderMap,
+                    coldRoom: window.crRenderList,
+                    closing: () => { window.searchStall?.(); },
+                    sched: () => window.renderSched(),
+                })[tab]?.();
+            }
 
             localStorage.setItem('activeTab', tab);
         };
@@ -12376,6 +13286,8 @@ setInterval(() => {
 
         window.addEventListener('DOMContentLoaded', () => {
     window.applyTabVisibility();
+    window.renderPatrolFloorSlider();
+    window.renderPatrolRosterFloorSelect();
     window.updatePatrolDateInputUI();
     window.switchTab('gallery');   // 每次都固定開圖庫
     if (window.lucide) lucide.createIcons();
@@ -14024,22 +14936,25 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                     </div>
                 </div>
 
-               <!-- 第二行：【全部, 花園仔, 地下, 一樓】靠左，【搜尋 + 匯出報表】靠右 -->
+               <!-- 第二行：【全部, 地下, 一樓, 二樓】靠左，【搜尋 + 匯出報表】靠右 -->
                 <div class="flex items-center justify-between gap-1 pt-0.5">
-                    <!-- 樓層滑動軌道 -->
-                    <div id="floorSliderTrack" class="relative bg-slate-200/90 p-0.5 rounded-xl flex items-center border border-slate-300/80 shadow-inner select-none w-[180px] h-[28px] overflow-hidden cursor-pointer touch-none">
-                        <div id="floorSliderThumb" class="absolute top-0.5 bottom-0.5 left-0 w-1/4 p-0.5 transition-transform duration-200 ease-out pointer-events-none">
-                            <div class="w-full h-full bg-blue-600 rounded-[9px] shadow-sm"></div>
+                    <!-- 樓層滑動軌道（樓層清單動態生成）＋樓層管理 -->
+                    <div class="flex items-center gap-1">
+                        <div id="floorSliderTrack" class="relative bg-slate-200/90 p-0.5 rounded-xl flex items-center border border-slate-300/80 shadow-inner select-none w-[180px] h-[28px] overflow-hidden cursor-pointer touch-none">
+                            <div id="floorSliderThumb" class="absolute top-0.5 bottom-0.5 left-0 p-0.5 transition-transform duration-200 ease-out pointer-events-none">
+                                <div class="w-full h-full bg-blue-600 rounded-[9px] shadow-sm"></div>
+                            </div>
                         </div>
-
-                        <button type="button" id="patrol-flt-all" onclick="window.filterPatrolFloor('ALL')" class="relative z-10 flex-1 text-center text-[12.5px] font-black text-white transition-colors duration-200 leading-none py-1">全部</button>
-                        <button type="button" id="patrol-flt-garden" onclick="window.filterPatrolFloor('花園仔')" class="relative z-10 flex-1 text-center text-[12.5px] font-bold text-slate-600 transition-colors duration-200 leading-none py-1">花園仔</button>
-                        <button type="button" id="patrol-flt-fish" onclick="window.filterPatrolFloor('地下')" class="relative z-10 flex-1 text-center text-[12.5px] font-bold text-slate-600 transition-colors duration-200 leading-none py-1">地下</button>
-                        <button type="button" id="patrol-flt-first" onclick="window.filterPatrolFloor('一樓')" class="relative z-10 flex-1 text-center text-[12.5px] font-bold text-slate-600 transition-colors duration-200 leading-none py-1">一樓</button>
+                        <button type="button" onclick="window.openFloorManageModal()" class="shrink-0 w-[28px] h-[28px] rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 hover:text-slate-700 border border-slate-300 flex items-center justify-center active:scale-95" title="管理樓層（新增／改名／刪除／排序）">
+                            <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>
+                        </button>
                     </div>
 
                     <!-- 右側：搜尋按鍵 + 匯出報表按鍵 -->
                     <div class="flex items-center space-x-1.5 shrink-0">
+                        <button type="button" onclick="window.openPatrolRosterModal()" class="px-2.5 py-1 bg-violet-50 hover:bg-violet-100 text-violet-700 border border-violet-200 rounded-xl text-xs font-bold active:scale-95 flex items-center shadow-2xs">
+                            <i data-lucide="clipboard-list" class="w-3.5 h-3.5 mr-1 text-violet-600"></i>名冊管理
+                        </button>
                         <button type="button" onclick="window.openPatrolSearchModal()" class="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-xl text-xs font-bold active:scale-95 flex items-center shadow-2xs">
                             <i data-lucide="search" class="w-3.5 h-3.5 mr-1 text-blue-600"></i>搜尋
                         </button>
@@ -14518,17 +15433,186 @@ window.pushMeetingReportsToAllIframes = (reports) => {
             </div>
         </main>
 
+        <!-- ====== 自訂分頁內容區（可新建／移除的自訂功能） ====== -->
+        <main id="customTabPage" class="hidden flex-1 min-h-0 flex flex-col relative z-10 bg-[#fdfbf7] overflow-hidden">
+            <div class="bg-[#fdfbf7]/95 backdrop-blur-md px-3 py-2 border-b border-[#e5dfd3] shadow-xs shrink-0 flex items-center justify-between z-20">
+                <div class="flex items-center space-x-2 min-w-0">
+                    <div class="w-6 h-6 rounded-lg bg-blue-500 text-white flex items-center justify-center shadow-xs shrink-0"><i data-lucide="layout-list" class="w-3.5 h-3.5"></i></div>
+                    <h2 id="customTabName" class="text-sm text-slate-800 tracking-wider font-black truncate">自訂分頁</h2>
+                </div>
+                <div class="flex items-center space-x-1.5 shrink-0">
+                    <button type="button" onclick="window.renameCustomTab(window._currentCustomTabId)" class="bg-slate-50 hover:bg-blue-50 text-slate-600 hover:text-blue-600 border border-slate-200 px-2 py-1 rounded-lg text-[11px] font-bold flex items-center transition-all active:scale-95" title="重新命名"><i data-lucide="edit-3" class="w-3 h-3 mr-1"></i>改名</button>
+                    <button type="button" onclick="window.clearCustomRecords(window._currentCustomTabId)" class="bg-slate-50 hover:bg-amber-50 text-slate-600 hover:text-amber-600 border border-slate-200 px-2 py-1 rounded-lg text-[11px] font-bold flex items-center transition-all active:scale-95" title="清空記錄"><i data-lucide="eraser" class="w-3 h-3 mr-1"></i>清空</button>
+                    <button type="button" onclick="window.removeCustomTab(window._currentCustomTabId)" class="bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 px-2 py-1 rounded-lg text-[11px] font-bold flex items-center transition-all active:scale-95" title="移除分頁"><i data-lucide="trash-2" class="w-3 h-3 mr-1"></i>移除</button>
+                </div>
+            </div>
+
+            <div class="px-3 py-2 bg-white border-b border-slate-200 shrink-0">
+                <div class="flex gap-2">
+                    <input id="customRecordTitle" placeholder="標題（例：上午巡查、今日交接）" class="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold focus:border-blue-500 focus:outline-none placeholder-slate-400">
+                    <button type="button" onclick="window.addCustomRecord()" class="px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-xs font-black shadow-sm active:scale-95 flex items-center gap-1 shrink-0"><i data-lucide="plus" class="w-3.5 h-3.5"></i>新增</button>
+                </div>
+                <input id="customRecordNote" placeholder="備註（可選填）" class="w-full mt-2 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold focus:border-blue-500 focus:outline-none placeholder-slate-400">
+            </div>
+
+            <div id="customTabList" class="flex-1 min-h-0 overflow-y-auto p-3 space-y-2 scrollbar-hide"></div>
+        </main>
+
+        <!-- ====== 成員排更（員工×日期更表，格式對照官方更表 Excel） ====== -->
+        <main id="schedPage" class="hidden flex-1 min-h-0 flex flex-col relative z-10 bg-[#fdfbf7] overflow-hidden">
+            <div class="bg-[#fdfbf7]/95 backdrop-blur-md px-3 py-2 border-b border-[#e5dfd3] shadow-xs shrink-0 flex items-center justify-between z-20 gap-2">
+                <div class="flex items-center space-x-2 min-w-0">
+                    <div class="w-6 h-6 rounded-lg bg-teal-500 text-white flex items-center justify-center shadow-xs shrink-0"><i data-lucide="calendar-check" class="w-3.5 h-3.5"></i></div>
+                    <h2 class="text-sm text-slate-800 tracking-wider font-black truncate">成員排更</h2>
+                </div>
+                <div class="flex items-center space-x-1.5 shrink-0">
+                    <button type="button" onclick="window.openSchedMemberModal()" class="bg-teal-50 text-teal-700 hover:bg-teal-100 border border-teal-200 px-2 py-1 rounded-lg text-xs font-bold flex items-center transition-all active:scale-95" title="編輯名單"><i data-lucide="users" class="w-3.5 h-3.5 mr-1"></i>編輯名單</button>
+                    <button type="button" onclick="window.saveSchedAll()" class="bg-teal-600 hover:bg-teal-700 text-white px-2 py-1 rounded-lg text-xs font-black flex items-center transition-all active:scale-95 shadow-xs" title="儲存排更"><i data-lucide="save" class="w-3.5 h-3.5 mr-1"></i>儲存</button>
+                </div>
+            </div>
+            <div class="px-3 py-2 bg-white border-b border-slate-200 shrink-0 flex items-center justify-between gap-2">
+                <div class="flex items-center space-x-2">
+                    <button type="button" onclick="window.changeSchedMonth(-1)" class="w-7 h-7 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center active:scale-90 border border-slate-200"><i data-lucide="chevron-left" class="w-4 h-4"></i></button>
+                    <span id="schedMonthTitle" class="text-sm font-black text-slate-800 tracking-wide px-1 min-w-[70px] text-center">2026年10月</span>
+                    <button type="button" onclick="window.changeSchedMonth(1)" class="w-7 h-7 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center active:scale-90 border border-slate-200"><i data-lucide="chevron-right" class="w-4 h-4"></i></button>
+                    <button type="button" onclick="window.changeSchedMonthToNow()" class="text-[11px] font-bold text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-2 py-1 rounded-lg active:scale-95">本月</button>
+                </div>
+                <div class="flex items-center space-x-1.5 shrink-0">
+                    <div class="flex items-center bg-slate-100 border border-slate-200 rounded-lg overflow-hidden" title="畫面字級縮放">
+                        <button type="button" onclick="window.schedZoomOut()" class="px-2 py-1 font-black text-slate-600 hover:bg-slate-200 active:bg-slate-300" style="font-size:12px">A−</button>
+                        <button type="button" onclick="window.schedZoomReset()" class="px-1.5 py-1 font-bold text-slate-400 hover:bg-slate-200 border-x border-slate-200" style="font-size:10px" title="重設字級">100%</button>
+                        <button type="button" onclick="window.schedZoomIn()" class="px-2 py-1 font-black text-slate-600 hover:bg-slate-200 active:bg-slate-300" style="font-size:12px">A＋</button>
+                    </div>
+                    <div id="schedMonthSummary" class="text-[11px] font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-full border border-slate-200 shrink-0"></div>
+                </div>
+            </div>
+            <div id="schedTableWrap" class="flex-1 min-h-0 overflow-auto bg-[#fdfbf7]">
+                <table id="schedTable" class="border-collapse w-full leading-tight min-w-max">
+                    <thead id="schedThead"></thead>
+                    <tbody id="schedTbody"></tbody>
+                    <tfoot id="schedTfoot"></tfoot>
+                </table>
+            </div>
+            <div id="schedHint" class="shrink-0 text-[10px] text-slate-400 px-3 py-1.5 border-t border-slate-200 bg-white">
+                每格＝上班時間｜下班時間｜標記（全日=1、半日=0.5、假、補假、周休、培訓、面試）。時間採小時制，直接手打輸入（例 07:30、730、7.5），失焦自動轉為 07:30 格式；時數自動計算（全日＝下班−上班、半日＝÷2）。可點「A＋／A−」放大縮小畫面。
+            </div>
+        </main>
+
+        <!-- 排更成員名單管理彈窗 -->
+        <div id="schedMemberModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[335] hidden flex-col items-center justify-center p-4">
+            <div class="bg-white rounded-2xl p-4 w-full max-w-[420px] shadow-2xl relative" onclick="event.stopPropagation()">
+                <header class="flex justify-between items-center pb-2.5 mb-2 border-b border-slate-100">
+                    <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="users" class="w-4 h-4 mr-2 text-teal-600"></i> 排更成員名單</h3>
+                    <button onclick="window.closeSchedMemberModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </header>
+                <div class="flex gap-2 mb-2">
+                    <input id="smNewId" placeholder="編號（例：CS025）" class="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold focus:border-teal-500 focus:outline-none placeholder-slate-400">
+                    <input id="smNewName" placeholder="姓名" class="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold focus:border-teal-500 focus:outline-none placeholder-slate-400">
+                    <button type="button" onclick="window.addSchedMember()" class="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-xs font-black active:scale-95 flex items-center gap-1 shrink-0"><i data-lucide="plus" class="w-3.5 h-3.5"></i>新增</button>
+                </div>
+                <div id="schedMemberList" class="max-h-[55vh] overflow-y-auto space-y-1.5"></div>
+            </div>
+        </div>
+
+
+<div id="floorManageModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[330] hidden flex-col items-center justify-center p-4">
+    <div class="bg-white rounded-2xl p-4 w-full max-w-[400px] shadow-2xl relative scrollbar-hide" onclick="event.stopPropagation()">
+        <header class="flex justify-between items-center pb-2.5 mb-2 border-b border-slate-100">
+            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="settings-2" class="w-4 h-4 mr-2 text-blue-500"></i> 管理樓層（巡查篩選）</h3>
+            <button onclick="window.closeFloorManageModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </header>
+
+        <p class="text-[11px] text-slate-400 mb-2">「全部」會自動置於最前；以下為樓層列表，可改名、排序、刪除；名冊與篩選會即時同步。</p>
+
+        <div id="floorManageList" class="space-y-1.5 max-h-[45vh] overflow-y-auto scrollbar-hide"></div>
+
+        <!-- 新增樓層 -->
+        <div class="mt-3 pt-2.5 border-t border-slate-100 flex gap-1.5">
+            <input id="newFloorName" placeholder="新樓層名稱，例：二樓、天台…" class="flex-1 bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-[12px] font-bold focus:border-blue-500 focus:outline-none" onkeydown="if(event.key==='Enter')window.addFloorFromInput()">
+            <button type="button" onclick="window.addFloorFromInput()" class="shrink-0 px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-[12px] font-black active:scale-95 flex items-center gap-1"><i data-lucide="plus" class="w-3.5 h-3.5"></i>新增</button>
+        </div>
+    </div>
+</div>
+
+<div id="patrolRosterModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[320] hidden flex-col items-center justify-center p-2 sm:p-4">
+    <div class="bg-white rounded-2xl p-3 sm:p-4 w-full max-w-[560px] shadow-2xl relative scrollbar-hide flex flex-col max-h-[90vh]" onclick="event.stopPropagation()">
+        <header class="flex justify-between items-center pb-2.5 mb-2 border-b border-slate-100 shrink-0">
+            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="clipboard-list" class="w-4 h-4 mr-2 text-violet-500"></i> 巡查名冊管理</h3>
+            <button onclick="window.closePatrolRosterModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </header>
+
+        <div class="overflow-y-auto scrollbar-hide flex-1 min-h-0 space-y-3">
+            <!-- ===== ① 現役名冊 ===== -->
+            <section>
+                <div class="flex items-center justify-between mb-1.5">
+                    <h4 class="text-xs font-black text-slate-700 flex items-center gap-1"><i data-lucide="edit-3" class="w-3.5 h-3.5 text-blue-500"></i>現役名冊（改完即時生效並同步）<span class="bg-violet-100 text-violet-700 text-[10px] font-black px-1.5 py-0.5 rounded-full" id="prTotalCount">0</span></h4>
+                    <button type="button" onclick="window.resetPatrolRosterToOfficial()" class="text-[10px] font-black text-amber-600 hover:underline">還原官方名冊</button>
+                </div>
+
+                <!-- 新增攤位 -->
+                <div class="bg-slate-50 border border-slate-200 rounded-xl p-2 mb-2 grid grid-cols-6 gap-1.5 items-center">
+                    <select id="prNewFloor" class="col-span-1 bg-white border border-slate-300 rounded-lg px-1 py-1 text-[11px] font-bold focus:outline-none">
+                        <option>花園仔</option><option>地下</option><option>一樓</option>
+                    </select>
+                    <input id="prNewId" placeholder="檔號" class="col-span-1 bg-white border border-slate-300 rounded-lg px-1.5 py-1 text-[11px] font-mono font-bold focus:outline-none">
+                    <input id="prNewName" placeholder="檔主姓名" class="col-span-2 bg-white border border-slate-300 rounded-lg px-1.5 py-1 text-[11px] font-bold focus:outline-none">
+                    <select id="prNewGender" class="col-span-1 bg-white border border-slate-300 rounded-lg px-1 py-1 text-[11px] font-bold focus:outline-none"><option>男</option><option>女</option></select>
+                    <button type="button" onclick="window.addPatrolStallFromForm()" class="col-span-1 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-[11px] font-black py-1 active:scale-95 flex items-center justify-center gap-0.5"><i data-lucide="plus" class="w-3 h-3"></i>新增</button>
+                    <input id="prNewType" placeholder="類別（雜貨/蔬菜/魚類…）" class="col-span-6 bg-white border border-slate-300 rounded-lg px-1.5 py-1 text-[11px] focus:outline-none">
+                </div>
+
+                <div class="border border-slate-200 rounded-xl overflow-hidden">
+                    <div class="max-h-[38vh] overflow-y-auto scrollbar-hide">
+                        <table class="w-full text-left">
+                            <thead class="bg-slate-100 text-[10px] text-slate-500 font-black sticky top-0">
+                                <tr><th class="py-1 px-1 w-7"></th><th class="py-1 px-1">樓層</th><th class="py-1 px-1">檔號</th><th class="py-1 px-1">姓名</th><th class="py-1 px-1 text-center">性別</th><th class="py-1 px-1">類別</th><th class="py-1 px-1 text-right">刪除</th></tr>
+                            </thead>
+                            <tbody id="patrolRosterTbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ===== ② 版本管理 ===== -->
+            <section>
+                <div class="flex items-center justify-between mb-1.5">
+                    <h4 class="text-xs font-black text-slate-700 flex items-center gap-1"><i data-lucide="history" class="w-3.5 h-3.5 text-emerald-500"></i>版本管理</h4>
+                    <button type="button" onclick="window.saveCurrentRosterAsVersion()" class="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-black active:scale-95 flex items-center gap-1"><i data-lucide="bookmark-plus" class="w-3 h-3"></i>另存為版本</button>
+                </div>
+                <div id="patrolVersionsList" class="space-y-1.5"></div>
+            </section>
+        </div>
+    </div>
+</div>
 
 <div id="tabVisibilityModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[300] hidden flex-col items-center justify-center p-4">
     <div class="bg-white rounded-2xl p-4 w-full max-w-[320px] shadow-2xl relative scrollbar-hide flex flex-col" onclick="event.stopPropagation()">
         <header class="flex justify-between items-center pb-2.5 mb-3 border-b border-slate-100">
-            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="layout-grid" class="w-4 h-4 mr-2 text-blue-500"></i> 自訂分頁顯示</h3>
-            <button onclick="window.closeTabVisibilityModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="layout-grid" class="w-4 h-4 mr-2 text-blue-500"></i> 分頁顯示與自訂</h3>
+            <div class="flex items-center gap-1">
+                <button onclick="window.createCustomTab()" class="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 rounded-lg text-[11px] font-black flex items-center gap-1 active:scale-95 transition-all" title="建立全新分頁"><i data-lucide="plus" class="w-3 h-3"></i>新增分頁</button>
+                <button onclick="window.closeTabVisibilityModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
         </header>
         <div id="tabVisibilityList" class="space-y-2 mb-4"></div>
         <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
             <button onclick="window.closeTabVisibilityModal()" class="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-bold">取消</button>
             <button onclick="window.saveTabVisibility()" class="px-4 py-1.5 bg-blue-500 text-white rounded-lg text-xs font-bold shadow-sm">儲存</button>
+        </div>
+    </div>
+</div>
+
+<div id="customRecordEditModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[310] hidden flex-col items-center justify-center p-4">
+    <div class="bg-white rounded-2xl p-4 w-full max-w-[320px] shadow-2xl relative scrollbar-hide flex flex-col" onclick="event.stopPropagation()">
+        <header class="flex justify-between items-center pb-2.5 mb-3 border-b border-slate-100">
+            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="edit-3" class="w-4 h-4 mr-2 text-blue-500"></i> 修改記錄</h3>
+            <button onclick="window.closeCustomRecordEditModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </header>
+        <input id="crEditTitleInput" placeholder="標題" class="w-full bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-2 text-sm font-bold focus:border-blue-500 focus:outline-none">
+        <textarea id="crEditNoteInput" placeholder="備註（可選填）" class="w-full mt-2 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-2 text-xs font-bold focus:border-blue-500 focus:outline-none resize-none h-24"></textarea>
+        <div class="flex justify-end space-x-2 pt-3 mt-2 border-t border-slate-100">
+            <button onclick="window.closeCustomRecordEditModal()" class="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-bold">取消</button>
+            <button onclick="window.saveCustomRecordEdit()" class="px-4 py-1.5 bg-blue-500 text-white rounded-lg text-xs font-bold shadow-sm">儲存</button>
         </div>
     </div>
 </div>
