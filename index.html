@@ -455,7 +455,21 @@
         };
 
         const cfgDoc = (key) => doc(db, 'artifacts', appId, 'public', 'data', 'config', key);
-        const syncConfig = (key, data, merge = false) => { if (currentUser) setDoc(cfgDoc(key), data, { merge }); };
+        const syncConfig = (key, data, merge = false) => {
+            if (!currentUser) { queueConfigWrite(key, data, merge); return Promise.resolve(false); }
+            return setDoc(cfgDoc(key), data, { merge }).then(() => true).catch(e => {
+                const code = e?.code || '';
+                window._lastSyncError = code + ' ' + (e?.message || '');
+                console.warn('[雲端寫入失敗]', key, code);
+                if (/permission-denied/.test(code)) {
+                    window.setConnectionStatus?.(false, 'Firestore 規則未允許讀寫');
+                    if (!window._permToastShown) { window._permToastShown = true; window.showToast('雲端寫入被拒：請把 Firestore 規則設為允許已登入使用者讀寫', true); }
+                } else if (!navigator.onLine) {
+                    queueConfigWrite(key, data, merge);
+                }
+                return false;
+            });
+        };
 window.syncConfig = syncConfig; // 👈 必備：開放給 iframe 雲端同步使用
 window.safeSetLocal = safeSetLocal;
 window.getLocal = getLocal;
@@ -5268,7 +5282,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
                     id: 'text-[30px] px-1.5 py-0.5 rounded-lg',
                     gender: 'text-[20px] px-1.5 py-0.5',
-                    name: 'text-base font-black',
+                    name: 'text-[19px] font-black',
                     sub: 'text-[13px]',
                     badge: 'text-[12px] px-1.5 py-0.5',
                     btn: 'w-11 h-11 rounded-lg',
@@ -5279,7 +5293,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
                     id: 'text-[25px] px-1.5 py-0.5 rounded-md',
                     gender: 'text-[17px] px-1 py-0.5',
-                    name: 'text-base font-black',
+                    name: 'text-[18px] font-black',
                     sub: 'text-[13px]',
                     badge: 'text-[11.5px] px-1.5 py-0.5',
                     btn: 'w-11 h-11 rounded-lg',
@@ -5290,7 +5304,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2 gap-1 w-full',
                     id: 'text-xl px-1.5 py-0.5 rounded-md',
                     gender: 'text-sm px-1 py-0.5',
-                    name: 'text-[15px] font-black',
+                    name: 'text-[16px] font-black',
                     sub: 'text-[12.5px]',
                     badge: 'text-[11px] px-1.5 py-0.5',
                     btn: 'w-10 h-10 rounded-lg',
@@ -5319,8 +5333,8 @@ window.clearTodayPatrolData = (e) => {
                             </div>
                             <div class="flex items-center gap-1.5 min-w-0">
                                 <span class="rounded px-1.5 py-0.5 font-black leading-none shrink-0 shadow-xs" style="background:${window.getPatrolFloorColor(stall.floor)};color:${window.floorLabelTextColor(window.getPatrolFloorColor(stall.floor))}">${stall.floor}</span>
-                                <span class="${S.sub} text-slate-500 font-bold truncate shrink-0">${stall.type}</span>
-                                <span class="${S.name} font-black text-slate-900 truncate">${stall.name || '無'}</span>
+                                <span class="${S.sub} text-slate-500 font-bold truncate min-w-0 flex-1">${stall.type}</span>
+                                <span class="${S.name} font-black text-slate-900 shrink-0 whitespace-nowrap">${stall.name || '無'}</span>
                             </div>
                         </div>
                         <div class="flex items-center gap-1.5 shrink-0">
@@ -8722,7 +8736,14 @@ window.autoSyncClosedStallsToPatrol(true); // 🌟 立即更新剔檔
                         safeSetLocal(localKey, data[Object.keys(data)[0]] !== undefined ? data[Object.keys(data)[0]] : data);
                         onUpdate(data);
                     }
-                }, console.error);
+                }, (err) => {
+                    const code = err?.code || '';
+                    console.warn('[即時監聽失敗]', key, code);
+                    if (/permission-denied/.test(code)) {
+                        window.setConnectionStatus?.(false, 'Firestore 規則未允許讀寫');
+                        if (!window._permToastShown) { window._permToastShown = true; window.showToast('雲端讀取被拒：請把 Firestore 規則設為允許已登入使用者讀寫', true); }
+                    }
+                });
             };
 
            onSnapshot(cfgDoc('meeting_report_data'), (snap) => {
@@ -13421,12 +13442,123 @@ setInterval(() => {
             });
         };
 
+        // ====== 雲端連線狀態與自動重連 ======
+        window.firebaseAuthError = '';
+        window.cloudConnected = false;
+        window.setConnectionStatus = (ok, text) => {
+            const dot = $('connectionDot'), st = $('connectionStatus');
+            window.cloudConnected = !!ok;
+            if (dot) {
+                dot.classList.toggle('bg-green-500', !!ok);
+                dot.classList.toggle('bg-amber-500', !ok && text === '連線中...');
+                dot.classList.toggle('bg-red-500', !ok && text !== '連線中...');
+            }
+            if (st) {
+                st.textContent = ok ? '已即時同步' : (text === '連線中...' ? '連線中...' : '未連線');
+                st.title = ok ? '雲端即時同步運作中，其他裝置的改動會即時推送' : (text + '｜' + (window.firebaseAuthError || ''));
+            }
+        };
+
+        // 未連線時暫存寫入，連線後自動補傳（避免離線／驗證未完成時改動消失）
+        function queueConfigWrite(key, data, merge) {
+            try {
+                const q = getLocal('work_pending_config_writes', []);
+                const rest = q.filter(x => x.key !== key);
+                rest.push({ key, data, merge: !!merge, ts: Date.now() });
+                safeSetLocal('work_pending_config_writes', rest.slice(-60));
+            } catch (e) {}
+        }
+        window.flushConfigWriteQueue = async () => {
+            if (!currentUser) return;
+            const q = getLocal('work_pending_config_writes', []);
+            if (!q.length) return;
+            safeSetLocal('work_pending_config_writes', []);
+            for (const item of q) {
+                try { await setDoc(cfgDoc(item.key), item.data, { merge: !!item.merge }); } catch (e) { console.warn('補傳失敗', item.key, e?.code); }
+            }
+        };
+
+        window.handleConnectionPillClick = async () => {
+            await window.reconnectCloud();
+            setTimeout(() => { if (!currentUser) window.openCloudHelpModal(); }, 1500);
+        };
+        window.openCloudHelpModal = () => {
+            const m = $('cloudHelpModal');
+            if (!m) return;
+            const det = $('cloudErrDetail');
+            if (det) det.textContent = window.firebaseAuthError || '（尚未取得錯誤碼，可能仍在連線中）';
+            m.classList.remove('hidden'); m.classList.add('flex');
+            if (window.lucide) lucide.createIcons();
+        };
+        window.closeCloudHelpModal = () => { const m = $('cloudHelpModal'); if (m) { m.classList.add('hidden'); m.classList.remove('flex'); } };
+        window.copyFirestoreRule = () => {
+            const rule = 'rules_version = \'2\';\nservice cloud.firestore {\n  match /databases/{database}/documents {\n    match /artifacts/{appId}/public/data/{document=**} {\n      allow read, write: if request.auth != null;\n    }\n  }\n}';
+            navigator.clipboard?.writeText(rule).then(() => window.showToast('✅ 已複製規則內容')).catch(() => window.showToast('複製失敗，請手動選取', true));
+        };
+
+        window.reconnectCloud = async () => {
+            window._authErrToastShown = true; // 手動重連不再彈重複提示
+            window.setConnectionStatus(false, '連線中...');
+            try { await initAuth(); } catch (e) {}
+            if (currentUser) {
+                window.setConnectionStatus(true, '系統已連線並同步');
+                window.showToast('✅ 雲端已重新連線');
+            } else {
+                window.showToast('仍未連上：' + (window.firebaseAuthError || '請檢查網絡'), true);
+            }
+        };
+        window.cloudDiagnostics = () => {
+            const info = {
+                已連線: !!currentUser,
+                使用者UID: currentUser?.uid || '(無)',
+                錯誤: window.firebaseAuthError || '(無)',
+                專案: appId,
+                網域: location.host,
+                待補傳筆數: getLocal('work_pending_config_writes', []).length
+            };
+            console.table(info);
+            return info;
+        };
+
+        let _authRetryTimer = null;
+        let _authAttempt = 0;
         async function initAuth() {
+            if (currentUser) return;
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) await signInWithCustomToken(auth, __initial_auth_token);
                 else await signInAnonymously(auth);
-            } catch(e) { window.showToast("連線驗證失敗", true); }
+                window.firebaseAuthError = '';
+                _authAttempt = 0;
+                if (_authRetryTimer) { clearTimeout(_authRetryTimer); _authRetryTimer = null; }
+            } catch(e) {
+                const code = (e && e.code) || '';
+                window.firebaseAuthError = (code ? code + ' — ' : '') + ((e && e.message) || '未知錯誤');
+                let msg = '連線失敗，自動重試中';
+                if (/operation-not-allowed|admin-restricted/.test(code)) msg = '請在 Firebase 啟用「匿名登入」';
+                else if (/unauthorized-domain/.test(code)) msg = '此網域未加入 Firebase 授權網域';
+                else if (/network|unavailable|timeout/.test(code)) msg = '網絡不通，自動重試中';
+                else if (/permission-denied/.test(code)) msg = 'Firestore 規則未允許讀寫';
+                window.setConnectionStatus(false, msg);
+                _authAttempt++;
+                const delay = Math.min(30000, 5000 * Math.max(1, _authAttempt));
+                if (_authRetryTimer) clearTimeout(_authRetryTimer);
+                _authRetryTimer = setTimeout(() => { initAuth(); }, delay);
+                if (!window._authErrToastShown) {
+                    window._authErrToastShown = true;
+                    console.warn('[Firebase 連線失敗]', code, e);
+                    window.showToast(msg + '（點標題列狀態可重試）', true);
+                }
+            }
         }
+
+        window.addEventListener('online', () => {
+            if (!currentUser) initAuth();
+            else { window.setConnectionStatus(true, '系統已連線並同步'); window.flushConfigWriteQueue?.(); }
+        });
+        window.addEventListener('offline', () => window.setConnectionStatus(false, '離線（改動稍後自動上傳）'));
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && !currentUser) initAuth();
+        });
 
         function setupPatrolSync() {
             if (!currentUser) return;
@@ -13444,10 +13576,10 @@ setInterval(() => {
         onAuthStateChanged(auth, (user) => {
             currentUser = user; const dot = $('connectionDot'), st = $('connectionStatus');
             if (user) { 
-                dot?.classList.replace('bg-red-500', 'bg-green-500'); 
-                if (st) st.textContent = '系統已連線並同步'; 
+                window.setConnectionStatus(true, '系統已連線並同步');
                 setupPureRealtimeSync(); 
                 setupPatrolSync();
+                window.flushConfigWriteQueue?.();
                 window.autoCleanupGalleryToTrash();
                 window.autoSyncClosedStallsToPatrol(true);
 
@@ -15034,7 +15166,7 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                 <div class="w-12"></div>
                 <div class="flex items-center justify-center space-x-2 shrink-0">
                     <h1 class="text-lg text-slate-800 tracking-widest font-black">工作記錄本</h1>
-                    <div class="flex items-center space-x-1 bg-white/70 px-2 py-0.5 rounded-full border border-slate-200 shadow-2xs">
+                    <div onclick="window.handleConnectionPillClick()" title="點擊可重新連線雲端／查看連線說明" class="flex items-center space-x-1 bg-white/70 px-2 py-0.5 rounded-full border border-slate-200 shadow-2xs cursor-pointer active:scale-95 transition-all">
                         <span id="connectionDot" class="w-1.5 h-1.5 rounded-full bg-red-500 transition-colors duration-300"></span>
                         <span id="connectionStatus" class="text-[8.5px] font-bold text-slate-500 tracking-wider">連線中...</span>
                     </div>
@@ -15843,6 +15975,37 @@ window.pushMeetingReportsToAllIframes = (reports) => {
         <div class="p-4 border-t border-slate-100 flex justify-end space-x-2 bg-slate-50/50">
             <button id="confirmBtnCancel" class="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-lg text-sm font-bold shadow-sm">取消</button>
             <button id="confirmBtnOk" class="px-4 py-2 bg-red-500 text-white rounded-lg text-sm font-bold shadow-sm">確定</button>
+        </div>
+    </div>
+</div>
+
+<div id="cloudHelpModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[350] hidden flex-col items-center justify-center p-3">
+    <div class="bg-white rounded-2xl p-4 w-full max-w-[420px] shadow-2xl" onclick="event.stopPropagation()">
+        <header class="flex justify-between items-center pb-2 mb-2 border-b border-slate-100">
+            <h3 class="font-black text-sm text-slate-800 flex items-center"><i data-lucide="wifi" class="w-4 h-4 mr-2 text-blue-500"></i> 雲端即時同步・連線檢查</h3>
+            <button onclick="window.closeCloudHelpModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </header>
+        <div class="text-[11px] text-slate-600 leading-relaxed space-y-1.5">
+            <p>本系統靠 Firebase 讓所有裝置共用同一份資料，任何一台改動都會即時推送給其他裝置。若一直顯示未連線，請在 <b>console.firebase.google.com</b> 檢查：</p>
+            <ol class="list-decimal ml-4 space-y-1">
+                <li><b>Authentication → Sign-in method</b>：把「匿名 (Anonymous)」設為<b>啟用</b>。</li>
+                <li><b>Firestore Database</b>：已建立資料庫，規則允許已登入者讀寫（下方可複製）。</li>
+                <li><b>Authentication → Settings → 授權網域</b>：加入 <span class="font-mono bg-slate-100 px-1 rounded">Michael25870.github.io</span>。</li>
+            </ol>
+            <div class="bg-slate-50 border border-slate-200 rounded-lg p-2 font-mono text-[10px] text-slate-600 whitespace-pre-wrap" id="firestoreRuleText">rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /artifacts/{appId}/public/data/{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}</div>
+            <button onclick="window.copyFirestoreRule()" class="text-[10.5px] font-black text-blue-600 underline">複製規則內容</button>
+            <p class="text-[10.5px] text-slate-500">目前錯誤：<span id="cloudErrDetail" class="font-mono text-rose-600"></span></p>
+        </div>
+        <div class="mt-3 flex justify-end gap-2">
+            <button onclick="window.reconnectCloud()" class="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-black active:scale-95">重新連線</button>
+            <button onclick="window.closeCloudHelpModal()" class="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-bold active:scale-95">關閉</button>
         </div>
     </div>
 </div>
