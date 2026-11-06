@@ -5268,7 +5268,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
                     id: 'text-[30px] px-1.5 py-0.5 rounded-lg',
                     gender: 'text-[20px] px-1.5 py-0.5',
-                    name: 'text-[19px] font-black',
+                    name: 'text-base font-black',
                     sub: 'text-[13px]',
                     badge: 'text-[12px] px-1.5 py-0.5',
                     btn: 'w-11 h-11 rounded-lg',
@@ -5279,7 +5279,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
                     id: 'text-[25px] px-1.5 py-0.5 rounded-md',
                     gender: 'text-[17px] px-1 py-0.5',
-                    name: 'text-[18px] font-black',
+                    name: 'text-base font-black',
                     sub: 'text-[13px]',
                     badge: 'text-[11.5px] px-1.5 py-0.5',
                     btn: 'w-11 h-11 rounded-lg',
@@ -5290,7 +5290,7 @@ window.clearTodayPatrolData = (e) => {
                     card: 'p-2 px-2 gap-1 w-full',
                     id: 'text-xl px-1.5 py-0.5 rounded-md',
                     gender: 'text-sm px-1 py-0.5',
-                    name: 'text-[16px] font-black',
+                    name: 'text-[15px] font-black',
                     sub: 'text-[12.5px]',
                     badge: 'text-[11px] px-1.5 py-0.5',
                     btn: 'w-10 h-10 rounded-lg',
@@ -5319,8 +5319,8 @@ window.clearTodayPatrolData = (e) => {
                             </div>
                             <div class="flex items-center gap-1.5 min-w-0">
                                 <span class="rounded px-1.5 py-0.5 font-black leading-none shrink-0 shadow-xs" style="background:${window.getPatrolFloorColor(stall.floor)};color:${window.floorLabelTextColor(window.getPatrolFloorColor(stall.floor))}">${stall.floor}</span>
-                                <span class="${S.sub} text-slate-500 font-bold truncate min-w-0 flex-1">${stall.type}</span>
-                                <span class="${S.name} font-black text-slate-900 shrink-0 whitespace-nowrap">${stall.name || '無'}</span>
+                                <span class="${S.sub} text-slate-500 font-bold truncate shrink-0">${stall.type}</span>
+                                <span class="${S.name} font-black text-slate-900 truncate">${stall.name || '無'}</span>
                             </div>
                         </div>
                         <div class="flex items-center gap-1.5 shrink-0">
