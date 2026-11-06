@@ -570,8 +570,8 @@ window.getLocal = getLocal;
         window.isUploading = false;
         window._isTogglingTask = false;
 
-        const defaultTabVisibility = { patrol: true, gallery: true, timeline: true, memo: true, map: true, coldRoom: true, closing: true };
-const defaultTabOrder = ['patrol', 'gallery', 'timeline', 'memo', 'map', 'coldRoom', 'closing', 'sched'];
+        const defaultTabVisibility = { patrol: true, gallery: true, timeline: true, memo: true, map: true, closing: true };
+const defaultTabOrder = ['patrol', 'gallery', 'timeline', 'memo', 'map', 'closing', 'sched'];
 
 // 正確讀取本機設定，不要強制全部顯示
 let tabVisibilityState = getLocal('work_cache_tab_visibility', defaultTabVisibility);
@@ -583,7 +583,6 @@ const tabMetadataMap = {
     timeline: { name: '動態', btnId: 'tabTimeline', icon: 'activity' },
     memo: { name: '備忘', btnId: 'tabMemo', icon: 'calendar-clock' },
     map: { name: '地圖', btnId: 'tabMap', icon: 'map' },
-    coldRoom: { name: '雪房', btnId: 'tabColdRoom', icon: 'snowflake' },
     closing: { name: '收工', btnId: 'tabClosing', icon: 'store' },
     sched: { name: '排更', btnId: 'tabSched', icon: 'calendar-check' },    
 };
@@ -917,12 +916,185 @@ const tabMetadataMap = {
             'pt_6': { name: '機動', x: 0, y: 0 },
             'pt_7': { name: '休息中', x: 0, y: 0 }
         };
-        window.currentMapRole = 'cs'; // 'cs' = 客服, 'clean' = 清潔
-        let mapData = { points: JSON.parse(JSON.stringify(defaultMapPoints)) }, memberSchedules = [], teamMembers = [];
+        window.currentMapRole = 'clean'; // 本系統只保留清潔員
+        let mapData = { points: JSON.parse(JSON.stringify(defaultCleanMapPoints)) }, memberSchedules = [], teamMembers = [];
         let csSchedulesStore = [], cleanSchedulesStore = [];
         let csMembersStore = [], cleanMembersStore = [];
         // 🌟 多日排班字典（依日期 YYYY-MM-DD 儲存每天排班陣列）
         let csMultiDaySchedules = {}, cleanMultiDaySchedules = {};
+
+        /* ============================================================
+           🗺️ 地圖分區與崗位：可新增／改名／移動／刪除（存本機＋雲端）
+           分區帶（band）＝整條樓層底色與名稱；分區框（box）＝一個崗位
+           每個 box 與人員點位（pt_xxx）對應，移動分區時人員標記同步跟隨
+           ============================================================ */
+        const MAP_ZONES_DEFAULT = [
+            { id: 'band_l1', kind: 'band', name: '一樓', x: 0, y: 0, w: 100, h: 33, bg: '#dbeafe', bgOpacity: 0.6, text: '#93c5fd' },
+            { id: 'band_g', kind: 'band', name: 'G層地面', x: 0, y: 33, w: 100, h: 31, bg: '#cffafe', bgOpacity: 0.4, text: '#67e8f9' },
+            { id: 'band_garden', kind: 'band', name: '花園仔', x: 0, y: 64, w: 100, h: 36, bg: '#d1fae5', bgOpacity: 0.6, text: '#6ee7b7' },
+            { id: 'pt_1', kind: 'box', name: '一樓+廁所', x: 29, y: 4, w: 42, h: 22, bg: '#dbeafe', border: '#60a5fa', text: '#1e40af' },
+            { id: 'pt_4', kind: 'box', name: '魚檔', x: 24, y: 37, w: 52, h: 20, bg: '#cffafe', border: '#06b6d4', text: '#155e75' },
+            { id: 'pt_8', kind: 'box', name: '花園仔(男廁)', x: 3, y: 73, w: 25, h: 23, bg: '#e0f2fe', border: '#0ea5e9', text: '#075985' },
+            { id: 'pt_3', kind: 'box', name: '花園仔', x: 31, y: 73, w: 28, h: 23, bg: '#dcfce7', border: '#22c55e', text: '#166534' },
+            { id: 'pt_9', kind: 'box', name: '花園仔(女廁)+(傷健廁所)', x: 61, y: 73, w: 36, h: 23, bg: '#ffe4e6', border: '#fb7185', text: '#9f1239' }
+        ];
+        let mapZones = getLocal('work_cache_map_zones', null);
+        if (!Array.isArray(mapZones) || !mapZones.length) {
+            mapZones = JSON.parse(JSON.stringify(MAP_ZONES_DEFAULT));
+            safeSetLocal('work_cache_map_zones', mapZones);
+        }
+        window.mapZones = mapZones;
+
+        // 把分區幾何同步到人員點位（box 取中心點），確保人員標記跟著分區移動
+        const syncPointsFromZones = () => {
+            const next = {
+                'pt_6': mapData.points?.pt_6 || { name: '機動', x: 0, y: 0 },
+                'pt_7': mapData.points?.pt_7 || { name: '休息中', x: 0, y: 0 }
+            };
+            Object.keys(mapData.points || {}).forEach(k => {
+                const p = mapData.points[k];
+                if (p && (p.x === 0 && p.y === 0) && !next[k]) next[k] = { ...p };
+            });
+            mapZones.forEach(z => {
+                if (z.kind !== 'box') return;
+                next[z.id] = { name: z.name, x: Math.round((z.x + z.w / 2) * 10) / 10, y: Math.round((z.y + z.h / 2) * 10) / 10 };
+            });
+            mapData.points = next;
+            safeSetLocal('work_cache_map_points', next);
+        };
+        window.syncPointsFromZones = syncPointsFromZones;
+
+        window.saveMapLayout = () => {
+            safeSetLocal('work_cache_map_zones', mapZones);
+            safeSetLocal('work_cache_map_points', mapData.points);
+            if (window.syncConfig) window.syncConfig('map_layout', { zones: mapZones, points: mapData.points });
+        };
+
+        window.renderMapZones = () => {
+            const layer = $('mapZoneLayer');
+            if (!layer) return;
+            layer.innerHTML = mapZones.map(z => {
+                const common = `position:absolute;left:${z.x}%;top:${z.y}%;width:${z.w}%;height:${z.h}%;`;
+                if (z.kind === 'band') {
+                    const bg = z.bg || '#e2e8f0';
+                    return `<div style="${common}background:${bg};opacity:${z.bgOpacity ?? 0.5};border-bottom:1px solid rgba(148,163,184,.7);" class="pointer-events-none">
+                        <span style="position:absolute;left:8px;top:4px;font-size:12px;font-weight:900;letter-spacing:.12em;color:${z.text || '#94a3b8'};user-select:none;">${prEsc(z.name)}</span>
+                    </div>`;
+                }
+                return `<div style="${common}background:${z.bg || '#dbeafe'};border:2px solid ${z.border || '#60a5fa'};border-radius:10px;box-shadow:inset 0 1px 2px rgba(0,0,0,.06);display:flex;align-items:flex-end;justify-content:center;padding-bottom:4px;pointer-events:none;">
+                        <span style="font-size:11px;font-weight:900;letter-spacing:.02em;color:${z.text || '#1e40af'};text-align:center;line-height:1.15;padding:0 2px;">${prEsc(z.name)}</span>
+                    </div>`;
+            }).join('');
+        };
+
+        /* ---- 地圖管理：分區（含樓層帶）＋崗位點位 ---- */
+        window.openMapManageModal = () => {
+            const m = $('mapManageModal');
+            if (m) { m.classList.remove('hidden'); m.classList.add('flex'); }
+            window.renderMapManager();
+            if (window.lucide) lucide.createIcons();
+        };
+        window.closeMapManageModal = () => { const m = $('mapManageModal'); if (m) { m.classList.add('hidden'); m.classList.remove('flex'); } };
+
+        window.renderMapManager = () => {
+            const zoneList = $('zoneManageList');
+            const pointList = $('pointManageList');
+            if (zoneList) {
+                zoneList.innerHTML = mapZones.map((z, i) => `
+                    <div class="border border-slate-200 rounded-lg p-1.5 bg-slate-50/60">
+                        <div class="flex items-center gap-1 mb-1">
+                            <span class="text-[10px] font-black px-1.5 py-0.5 rounded ${z.kind === 'band' ? 'bg-slate-200 text-slate-700' : 'bg-blue-100 text-blue-700'}">${z.kind === 'band' ? '樓層帶' : '崗位框'}</span>
+                            <input value="${prEsc(z.name)}" onchange="window.updateMapZone(${i},'name',this.value)" class="flex-1 min-w-0 bg-white border border-slate-300 rounded-md px-1.5 py-1 text-[12px] font-bold text-slate-800 focus:outline-none focus:border-blue-500">
+                            ${z.kind === 'box' ? `<input type="color" value="${z.bg}" onchange="window.updateMapZone(${i},'bg',this.value)" title="底色" class="w-6 h-6 rounded border border-slate-300 bg-white p-0">` : ''}
+                            <button onclick="window.moveMapZone(${i},-1)" class="w-6 h-6 rounded bg-white border border-slate-300 text-slate-500 active:scale-95"><i data-lucide="chevron-up" class="w-3.5 h-3.5 mx-auto"></i></button>
+                            <button onclick="window.moveMapZone(${i},1)" class="w-6 h-6 rounded bg-white border border-slate-300 text-slate-500 active:scale-95"><i data-lucide="chevron-down" class="w-3.5 h-3.5 mx-auto"></i></button>
+                            <button onclick="window.deleteMapZone(${i})" class="w-6 h-6 rounded bg-rose-50 border border-rose-200 text-rose-600 active:scale-95"><i data-lucide="trash-2" class="w-3.5 h-3.5 mx-auto"></i></button>
+                        </div>
+                        <div class="grid grid-cols-4 gap-1">
+                            <label class="text-[9.5px] text-slate-500 font-bold">X%<input type="number" value="${z.x}" onchange="window.updateMapZone(${i},'x',+this.value)" class="w-full border border-slate-300 rounded px-1 py-0.5 text-[11px] font-mono text-center"></label>
+                            <label class="text-[9.5px] text-slate-500 font-bold">Y%<input type="number" value="${z.y}" onchange="window.updateMapZone(${i},'y',+this.value)" class="w-full border border-slate-300 rounded px-1 py-0.5 text-[11px] font-mono text-center"></label>
+                            <label class="text-[9.5px] text-slate-500 font-bold">寬%<input type="number" value="${z.w}" onchange="window.updateMapZone(${i},'w',+this.value)" class="w-full border border-slate-300 rounded px-1 py-0.5 text-[11px] font-mono text-center"></label>
+                            <label class="text-[9.5px] text-slate-500 font-bold">高%<input type="number" value="${z.h}" onchange="window.updateMapZone(${i},'h',+this.value)" class="w-full border border-slate-300 rounded px-1 py-0.5 text-[11px] font-mono text-center"></label>
+                        </div>
+                    </div>`).join('') || '<p class="text-[11px] text-slate-400 text-center py-3">尚無分區</p>';
+            }
+            if (pointList) {
+                const pts = Object.entries(mapData.points).filter(([, p]) => !(p.x === 0 && p.y === 0));
+                pointList.innerHTML = pts.map(([id, p]) => `
+                    <div class="flex items-center gap-1 border border-slate-200 rounded-lg px-1.5 py-1 bg-white">
+                        <span class="text-[9.5px] font-mono font-bold text-slate-400 shrink-0">${id}</span>
+                        <span class="text-[11.5px] font-bold text-slate-800 truncate flex-1" title="由上方分區名稱決定">${prEsc(p.name)}</span>
+                        <span class="text-[10px] font-mono text-slate-400 shrink-0">${p.x}% , ${p.y}%</span>
+                    </div>`).join('') || '<p class="text-[11px] text-slate-400 text-center py-3">尚無崗位</p>';
+                pointList.insertAdjacentHTML('beforeend', `<p class="text-[10px] text-slate-400 mt-1 leading-snug">提示：人員位置由「崗位框」自動取中心點，改分區位置即同步。外部「機動 / 休息中」固定在右側站點欄。</p>`);
+            }
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.updateMapZone = (idx, field, val) => {
+            const z = mapZones[idx];
+            if (!z) return;
+            if (field === 'x' || field === 'y' || field === 'w' || field === 'h') {
+                const n = Number(val);
+                if (!isFinite(n)) return;
+                z[field] = Math.max(0, Math.min(100, n));
+            } else {
+                z[field] = val;
+            }
+            if (z.kind === 'box' && field === 'name' && mapData.points[z.id]) mapData.points[z.id].name = val;
+            syncPointsFromZones();
+            window.saveMapLayout();
+            window.renderMapZones();
+            window.renderMapManager();
+            window.updateMapSimulation();
+        };
+
+        window.moveMapZone = (idx, dir) => {
+            const j = idx + dir;
+            if (j < 0 || j >= mapZones.length) return;
+            const tmp = mapZones[idx]; mapZones[idx] = mapZones[j]; mapZones[j] = tmp;
+            window.saveMapLayout(); window.renderMapZones(); window.renderMapManager(); window.updateMapSimulation();
+        };
+
+        window.deleteMapZone = (idx) => {
+            const z = mapZones[idx];
+            if (!z) return;
+            window.showConfirm('刪除此分區？', `「${z.name}」將從地圖移除${z.kind === 'box' ? '，其人員位置亦一併移除' : ''}。`, () => {
+                mapZones.splice(idx, 1);
+                syncPointsFromZones();
+                window.saveMapLayout(); window.renderMapZones(); window.renderMapManager(); window.updateMapSimulation();
+                window.showToast('已刪除分區');
+            });
+        };
+
+        window.addMapZone = (kind) => {
+            const nameEl = $('newMapZoneName');
+            const name = (nameEl?.value || '').trim();
+            if (!name) { window.showToast('請先輸入分區名稱', true); return; }
+            const isBand = kind === 'band';
+            const id = isBand ? 'band_z' + Date.now().toString(36) : 'pt_z' + Date.now().toString(36);
+            mapZones.push(isBand
+                ? { id, kind: 'band', name, x: 0, y: 70, w: 100, h: 15, bg: '#e2e8f0', bgOpacity: 0.5, text: '#94a3b8' }
+                : { id, kind: 'box', name, x: 20, y: 40, w: 60, h: 18, bg: '#dbeafe', border: '#60a5fa', text: '#1e40af' });
+            if (!isBand) mapData.points[id] = { name, x: 50, y: 49 };
+            syncPointsFromZones();
+            window.saveMapLayout();
+            if (nameEl) nameEl.value = '';
+            window.renderMapZones(); window.renderMapManager(); window.updateMapSimulation();
+            window.showToast(`已新增${isBand ? '樓層帶' : '崗位'}「${name}」`);
+        };
+
+        window.resetMapLayout = () => {
+            window.showConfirm('還原地圖預設', '將把分區與崗位還原為系統預設樣式，確定？', () => {
+                mapZones = JSON.parse(JSON.stringify(MAP_ZONES_DEFAULT));
+                mapData.points = JSON.parse(JSON.stringify(defaultCleanMapPoints));
+                window.mapZones = mapZones;
+                window.saveMapLayout();
+                window.renderMapZones(); window.renderMapManager(); window.updateMapSimulation();
+                window.showToast('✅ 已還原地圖預設');
+            });
+        };
+
 
         // 🌟 人員頭像與編號持久化儲存庫
         let memberProfilesStore = getLocal('work_cache_member_profiles', {});
@@ -2909,20 +3081,13 @@ window.openMemberProfilePopup(name, window._currentPopupLocation);
             window.showToast(`✅ 已新增【${dateVal}】特殊排程（休息 ${restHours || '0h'}）！`);
         };
 
-        // 🌟 把它貼在這裡：強制的「所屬分類」切換執行函式
+        // 本系統只保留清潔員：不論傳入什麼分類，一律歸入清潔
         window.setMemberRoleCategory = (name, targetRole) => {
             const canonical = window.resolveMemberIdentity ? window.resolveMemberIdentity(name) : name;
-            
-            // 從兩邊陣列先清除
+
             csMembersStore = csMembersStore.filter(m => m !== canonical);
             cleanMembersStore = cleanMembersStore.filter(m => m !== canonical);
-
-            // 加入目標陣列
-            if (targetRole === 'clean') {
-                if (!cleanMembersStore.includes(canonical)) cleanMembersStore.push(canonical);
-            } else {
-                if (!csMembersStore.includes(canonical)) csMembersStore.push(canonical);
-            }
+            if (!cleanMembersStore.includes(canonical)) cleanMembersStore.push(canonical);
 
             // 同步儲存至本機與雲端
             safeSetLocal('work_cache_team_members', csMembersStore);
@@ -3049,12 +3214,11 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
                             </div>
                         </div>
 
-                        <!-- 🌟 新增：成員所屬分類切換（客服 / 清潔） -->
+                        <!-- 所屬分類：本系統只設清潔員，固定為清潔 -->
                         <div class="flex items-center justify-between">
                             <span class="text-[11px] font-bold text-slate-500">所屬分類：</span>
                             <div class="flex gap-1">
-                                <button type="button" onclick="window.setMemberRoleCategory('${safeNameAttr}', 'cs')" class="px-2.5 py-0.5 rounded-md text-xs font-black border transition-all ${cleanMembersStore.includes(canonicalName) ? 'bg-white text-slate-600 border-slate-200' : 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'}">客服</button>
-                                <button type="button" onclick="window.setMemberRoleCategory('${safeNameAttr}', 'clean')" class="px-2.5 py-0.5 rounded-md text-xs font-black border transition-all ${cleanMembersStore.includes(canonicalName) ? 'bg-teal-600 text-white border-teal-600 shadow-2xs' : 'bg-white text-slate-600 border-slate-200'}">清潔</button>
+                                <button type="button" class="px-2.5 py-0.5 rounded-md text-xs font-black border bg-teal-600 text-white border-teal-600 shadow-2xs">清潔</button>
                             </div>
                         </div>
 
@@ -3198,17 +3362,19 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
         };
 
        window.toggleMapRoleMode = (forceMode) => {
-            window.currentMapRole = forceMode || (window.currentMapRole === 'cs' ? 'clean' : 'cs');
-            const isClean = window.currentMapRole === 'clean';
+            // 清潔專用：不論點擊與否，一律維持清潔模式
+            window.currentMapRole = 'clean';
+            const isClean = true;
 
-            // 🌟 修正：同時支援地圖右上角按鈕與頂部排班按鈕的 ID 尋找，防止找不到物件而中斷
-            const roleBtn = $('mapRoleToggleBtn') || document.querySelector('[onclick*="toggleMapRoleMode"]');
+            // 角色切換按鈕直接隱藏（只保留清潔員）
+            const roleBtn = $('mapRoleToggleBtn');
             if (roleBtn) {
-                roleBtn.innerText = isClean ? '清潔' : '客服';
+                roleBtn.style.display = 'none';
             }
 
-            $('mapCsLayer')?.classList.toggle('hidden', isClean);
-            $('mapCleanLayer')?.classList.toggle('hidden', !isClean);
+            $('mapCsLayer')?.classList.add('hidden');
+            $('mapCleanLayer')?.classList.remove('hidden');
+            $('mapCsLayer')?.style.setProperty('display', 'none');
 
             $('station-pt_2')?.classList.toggle('hidden', isClean);
             const pt6Station = $('station-pt_6');
@@ -3228,8 +3394,9 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
                 }
             }
 
-            if ($('scheduleBtnText')) $('scheduleBtnText').innerText = isClean ? '清潔排班' : '成員排班';
-            mapData.points = JSON.parse(JSON.stringify(isClean ? defaultCleanMapPoints : defaultMapPoints));
+            if ($('scheduleBtnText')) $('scheduleBtnText').innerText = '清潔排班';
+            // 讀回使用者已編輯的分區／崗位（不再以預設覆蓋），並讓點位跟隨分區
+            if (typeof syncPointsFromZones === 'function') syncPointsFromZones();
             
             // 🌟 防呆保底：保持真實清潔名單，不再塞入清潔員A~F假人
             if (isClean && !Array.isArray(cleanMembersStore)) {
@@ -3823,16 +3990,18 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
         let patrolCalViewYear = _initPatrolDateParts[0] || new Date().getFullYear();
         let patrolCalViewMonth = (_initPatrolDateParts[1] || (new Date().getMonth() + 1)) - 1;
 
-        const PATROL_TIME_SLOTS = ['上午9點', '上午11點', '下午4點', '下午6點'];
+        const PATROL_TIME_SLOTS = ['上午9點', '上午11點', '中午1點', '下午4點', '下午6點'];
         const PATROL_SLOT_SELECTED_COLORS = [
             'bg-amber-500 text-white shadow-xs',
             'bg-blue-600 text-white shadow-xs',
+            'bg-teal-600 text-white shadow-xs',
             'bg-indigo-600 text-white shadow-xs',
             'bg-purple-600 text-white shadow-xs'
         ];
         const PATROL_SLOT_MINUTES = {
             '上午9點': 9 * 60,
             '上午11點': 11 * 60,
+            '中午1點': 13 * 60,
             '下午4點': 16 * 60,
             '下午6點': 18 * 60
         };
@@ -3849,6 +4018,7 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
             const mins = now.getHours() * 60 + now.getMinutes();
             if (mins >= 18 * 60) return '下午6點';   // 18:00 起
             if (mins >= 16 * 60) return '下午4點';   // 16:00 起
+            if (mins >= 13 * 60) return '中午1點';   // 13:00 起
             if (mins >= 11 * 60) return '上午11點';  // 11:00 起
             if (mins >= 9 * 60)  return '上午9點';   // 09:00 起
             return '上午9點';                        // 09:00 前預設
@@ -3873,7 +4043,7 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
             if (patrolSlotTimer) clearTimeout(patrolSlotTimer);
             const now = window.getNow ? window.getNow() : new Date();
             const curSecs = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
-            const targets = [9 * 3600, 11 * 3600, 16 * 3600, 18 * 3600];
+            const targets = [9 * 3600, 11 * 3600, 13 * 3600, 16 * 3600, 18 * 3600];
             let nextSecs = targets.find(t => t > curSecs);
             let waitMs = nextSecs !== undefined
                 ? (nextSecs - curSecs) * 1000
@@ -3894,7 +4064,7 @@ window.calcAndSaveDualRest = (memberName, shouldSave = false) => {
         const urlParams = new URLSearchParams(window.location.search);
         const isPopoutWindow = urlParams.get('view') === 'popout' || window.name === 'WorkRecordPopup';
         const scaleStorageKey = isPopoutWindow ? 'patrol_scale_popout' : 'patrol_scale_main';
-        let patrolCardScale = sessionStorage.getItem(scaleStorageKey) || localStorage.getItem(scaleStorageKey) || '100';
+        let patrolCardScale = sessionStorage.getItem(scaleStorageKey) || localStorage.getItem(scaleStorageKey) || '125';
 
         window.setPatrolCardScale = (scale) => {
             patrolCardScale = scale;
@@ -4943,7 +5113,7 @@ window.clearTodayPatrolData = (e) => {
             patrolSlot = slot;
             window.clearFocusAutoTimer();
             
-            const slotTimes = ['09:00', '11:00', '16:00', '18:00'];
+            const slotTimes = ['09:00', '11:00', '13:00', '16:00', '18:00'];
 
             PATROL_TIME_SLOTS.forEach((s, idx) => {
                 const btn = $(`patrol-slot-${idx}`);
@@ -5096,36 +5266,36 @@ window.clearTodayPatrolData = (e) => {
                 // 🌟 檔號黑藥丸左右收窄為 px-1.5，性別標籤收窄為 px-1
                 const S = scale === '150' ? {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
-                    id: 'text-[27px] px-1.5 py-0.5 rounded-lg',
-                    gender: 'text-[18px] px-1.5 py-0.5',
-                    name: 'text-sm font-black',
-                    sub: 'text-[11px]',
-                    badge: 'text-[10px] px-1.5 py-0.5',
-                    btn: 'w-10 h-10 rounded-lg',
-                    btnMain: 'text-sm',
-                    btnSub: 'text-[9px] mt-0.5 scale-90',
+                    id: 'text-[30px] px-1.5 py-0.5 rounded-lg',
+                    gender: 'text-[20px] px-1.5 py-0.5',
+                    name: 'text-base font-black',
+                    sub: 'text-[13px]',
+                    badge: 'text-[12px] px-1.5 py-0.5',
+                    btn: 'w-11 h-11 rounded-lg',
+                    btnMain: 'text-base',
+                    btnSub: 'text-[10px] mt-0.5 scale-90',
                     layout: 'stack'
                 } : scale === '125' ? {
                     card: 'p-2 px-2.5 gap-1.5 w-full',
-                    id: 'text-[22.5px] px-1.5 py-0.5 rounded-md',
-                    gender: 'text-[15px] px-1 py-0.5',
-                    name: 'text-sm font-black',
-                    sub: 'text-[11px]',
-                    badge: 'text-[10px] px-1.5 py-0.5',
-                    btn: 'w-10 h-10 rounded-lg',
-                    btnMain: 'text-sm',
-                    btnSub: 'text-[9px] mt-0.5 scale-90',
+                    id: 'text-[25px] px-1.5 py-0.5 rounded-md',
+                    gender: 'text-[17px] px-1 py-0.5',
+                    name: 'text-base font-black',
+                    sub: 'text-[13px]',
+                    badge: 'text-[11.5px] px-1.5 py-0.5',
+                    btn: 'w-11 h-11 rounded-lg',
+                    btnMain: 'text-[15px]',
+                    btnSub: 'text-[10px] mt-0.5 scale-90',
                     layout: 'stack'
                 } : {
                     card: 'p-2 px-2 gap-1 w-full',
-                    id: 'text-lg px-1.5 py-0.5 rounded-md',
-                    gender: 'text-xs px-1 py-0.5',
-                    name: 'text-sm font-black',
-                    sub: 'text-[11px]',
-                    badge: 'text-[10px] px-1.5 py-0.5',
+                    id: 'text-xl px-1.5 py-0.5 rounded-md',
+                    gender: 'text-sm px-1 py-0.5',
+                    name: 'text-[15px] font-black',
+                    sub: 'text-[12.5px]',
+                    badge: 'text-[11px] px-1.5 py-0.5',
                     btn: 'w-10 h-10 rounded-lg',
-                    btnMain: 'text-sm',
-                    btnSub: 'text-[9px] mt-0.5 scale-90',
+                    btnMain: 'text-[15px]',
+                    btnSub: 'text-[9.5px] mt-0.5 scale-90',
                     layout: 'inline'
                 };
 
@@ -5326,17 +5496,14 @@ window.clearTodayPatrolData = (e) => {
             // 📄 分頁 1：剔檔表
             const patrolRows = [
                 ['巡查日期', currentPatrolDate],
-                ['樓層', '攤位編號', '售賣種類', '承租人姓名', '性別', '上午9點', '上午11點', '下午4點', '下午6點']
+                ['樓層', '攤位編號', '售賣種類', '承租人姓名', '性別', ...PATROL_TIME_SLOTS]
             ];
             patrolRoster.forEach(s => {
                 const k = window.getPatrolKey(s);
                 const d = currentRecords[k] || {};
                 patrolRows.push([
                     s.floor, s.id, s.type, s.name, s.gender,
-                    d['上午9點'] || '',
-                    d['上午11點'] || '',
-                    d['下午4點'] || '',
-                    d['下午6點'] || ''
+                    ...PATROL_TIME_SLOTS.map(slot => d[slot] || '')
                 ]);
             });
 
@@ -5363,7 +5530,7 @@ window.clearTodayPatrolData = (e) => {
                 const wsTemp = XLSX.utils.aoa_to_sheet(tempRows);
 
                 // 設定欄位寬度與橫向列印屬性
-                wsPatrol['!cols'] = [{ wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 6 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 10 }];
+                wsPatrol['!cols'] = [{ wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 6 }, ...PATROL_TIME_SLOTS.map(() => ({ wch: 10 }))];
                 wsTemp['!cols'] = [
                     { wch: 12 },
                     ...RAW_TEMPERATURE_POINTS.map(pt => ({ wch: Math.max(10, pt.name.length * 2 + 2) })),
@@ -8506,15 +8673,20 @@ window.autoSyncClosedStallsToPatrol(true); // 🌟 立即更新剔檔
             splitHoursState = getLocal('work_cache_split_hours', {});
             futureMemos = getLocal('work_cache_future_memos', []);
             mapData = getLocal('work_cache_map_data', { points: {} });
-            csMembersStore = getLocal('work_cache_team_members', ['周靜儀', '蔣開紅', '何雪芬', '黃美濃', '林浩霆', '黃永超', '李頌瑤', '譚建安', '甘永寧', '陳麗嬋', '姚桂菊', '嚴飛菲']);
-            cleanMembersStore = getLocal('work_cache_clean_members', ['清潔員A', '清潔員B', '清潔員C', '清潔員D', '清潔員E', '清潔員F']);
-            teamMembers = [...csMembersStore];
+            // 只保留清潔員：客服名單不再預設塞入假資料
+            csMembersStore = getLocal('work_cache_team_members', []);
+            cleanMembersStore = getLocal('work_cache_clean_members', []);
+            teamMembers = [...cleanMembersStore];
 
             crRecords = getLocal('coldRoomRecords', []);
             crItemTypes = getLocal('coldRoomTypes', ['海鮮', '肉類', '蔬果', '包裝冰', '其他']);
             if (!crItemTypes.includes('包裝冰')) crItemTypes.push('包裝冰');
 
-            mapData.points = JSON.parse(JSON.stringify(defaultMapPoints));
+            // 地圖點位：優先讀使用者已編輯的配置，否則用清潔預設
+            const _savedMapPts = getLocal('work_cache_map_points', null);
+            mapData.points = (_savedMapPts && Object.keys(_savedMapPts).length)
+                ? _savedMapPts
+                : JSON.parse(JSON.stringify(defaultCleanMapPoints));
 
             // 🌟 升級：載入 5 日排班快取字典，並自動轉換舊版資料
             const todayInitStr = getNowInputStrs().date;
@@ -8664,6 +8836,19 @@ window.autoSyncClosedStallsToPatrol(true); // 🌟 立即更新剔檔
                     safeSetLocal('work_cache_patrol_floor_colors', patrolFloorColors);
                     if (window.renderFloorManager) window.renderFloorManager();
                     if (!$('patrolPage')?.classList.contains('hidden')) window.renderPatrol();
+                }
+            });
+
+            // 🗺️ 地圖分區／崗位雲端同步
+            bindSync('map_layout', 'work_cache_map_zones', d => {
+                if (d && Array.isArray(d.zones) && d.zones.length) {
+                    mapZones = d.zones;
+                    window.mapZones = mapZones;
+                    if (d.points && typeof d.points === 'object') mapData.points = d.points;
+                    safeSetLocal('work_cache_map_zones', mapZones);
+                    if (window.renderMapZones) window.renderMapZones();
+                    if (window.renderMapManager) window.renderMapManager();
+                    if (!$('mapPage')?.classList.contains('hidden')) window.updateMapSimulation();
                 }
             });
 
@@ -9087,7 +9272,7 @@ window.autoSyncClosedStallsToPatrol(true); // 🌟 立即更新剔檔
             } catch(e) {}
 
 }
-window.renderMap = () => { const c = $('mapPointsContainer'); if (c) c.innerHTML = ''; window.updateMapSimulation(); };
+window.renderMap = () => { if (window.renderMapZones) window.renderMapZones(); const c = $('mapPointsContainer'); if (c) c.innerHTML = ''; window.updateMapSimulation(); };
 
         window.updateMapSimulation = () => {
             if ($('mapPage')?.classList.contains('hidden')) return;
@@ -13289,6 +13474,8 @@ setInterval(() => {
     window.renderPatrolFloorSlider();
     window.renderPatrolRosterFloorSelect();
     window.updatePatrolDateInputUI();
+    if (window.syncPointsFromZones) window.syncPointsFromZones();
+    if (window.renderMapZones) window.renderMapZones();
     window.switchTab('gallery');   // 每次都固定開圖庫
     if (window.lucide) lucide.createIcons();
 });
@@ -14986,11 +15173,20 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                         <span class="text-[12.5px] font-bold leading-tight tracking-tight">上午11點</span>
                     </button>
 
+                    <!-- 中午1點 -->
+                    <button id="patrol-slot-2" type="button" onclick="window.setPatrolSlot('中午1點')" 
+                            class="flex-1 py-1 px-1 rounded-xl flex flex-col items-center justify-center transition-all bg-white/80 hover:bg-white text-slate-600 border border-slate-200/80 shadow-2xs">
+                        <span class="text-[9px] font-mono tracking-tighter text-slate-400 leading-none mb-0.5 flex items-center gap-0.5">
+                            <i data-lucide="clock" class="w-2.5 h-2.5 text-slate-400"></i>13:00
+                        </span>
+                        <span class="text-[12.5px] font-bold leading-tight tracking-tight">中午1點</span>
+                    </button>
+
                     <!-- 中央分割線 -->
                     <div class="w-[1.5px] h-6 bg-slate-300/70 mx-0.5 shrink-0 rounded-full"></div>
 
                     <!-- 下午4點 -->
-                    <button id="patrol-slot-2" type="button" onclick="window.setPatrolSlot('下午4點')" 
+                    <button id="patrol-slot-3" type="button" onclick="window.setPatrolSlot('下午4點')" 
                             class="flex-1 py-1 px-1 rounded-xl flex flex-col items-center justify-center transition-all bg-white/80 hover:bg-white text-slate-600 border border-slate-200/80 shadow-2xs">
                         <span class="text-[9px] font-mono tracking-tighter text-slate-400 leading-none mb-0.5 flex items-center gap-0.5">
                             <i data-lucide="clock" class="w-2.5 h-2.5 text-slate-400"></i>16:00
@@ -14999,7 +15195,7 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                     </button>
 
                     <!-- 下午6點 -->
-                    <button id="patrol-slot-3" type="button" onclick="window.setPatrolSlot('下午6點')" 
+                    <button id="patrol-slot-4" type="button" onclick="window.setPatrolSlot('下午6點')" 
                             class="flex-1 py-1 px-1 rounded-xl flex flex-col items-center justify-center transition-all bg-white/80 hover:bg-white text-slate-600 border border-slate-200/80 shadow-2xs">
                         <span class="text-[9px] font-mono tracking-tighter text-slate-400 leading-none mb-0.5 flex items-center gap-0.5">
                             <i data-lucide="clock" class="w-2.5 h-2.5 text-slate-400"></i>18:00
@@ -15184,7 +15380,10 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                     <button type="button" class="sim-restore-btn hidden bg-white border border-slate-200 text-slate-600 hover:text-blue-600 rounded-md w-6 h-6 shadow-sm active:scale-95 flex items-center justify-center" onclick="window.restoreRealTime()"><i data-lucide="rotate-ccw" class="w-3.5 h-3.5 pointer-events-none"></i></button>
                     <button type="button" class="sim-toggle-btn bg-white border border-slate-200 text-slate-600 hover:text-blue-600 rounded-md w-6 h-6 shadow-sm active:scale-95 flex items-center justify-center" onclick="window.toggleSimulation()"><i data-lucide="fast-forward" class="w-3.5 h-3.5 pointer-events-none"></i></button>
                 </div>
-                <button onclick="window.openScheduleManager()" class="bg-slate-50 text-slate-600 border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center hover:bg-emerald-50 active:scale-95 text-[11px] font-bold tracking-wide transition-colors shrink-0 shadow-sm z-10"><i data-lucide="users" class="w-3.5 h-3.5 mr-1 text-emerald-500"></i> <span id="scheduleBtnText">成員排班</span></button>
+                <div class="flex items-center gap-1 shrink-0 z-10">
+                <button onclick="window.openMapManageModal()" class="bg-slate-50 text-slate-600 border border-slate-200 px-2 py-1.5 rounded-lg flex items-center hover:bg-blue-50 active:scale-95 text-[11px] font-bold tracking-wide transition-colors shrink-0 shadow-sm" title="新增／更改地圖分區與崗位"><i data-lucide="layout-grid" class="w-3.5 h-3.5 mr-1 text-blue-500"></i> <span>地圖管理</span></button>
+                <button onclick="window.openScheduleManager()" class="bg-slate-50 text-slate-600 border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center hover:bg-emerald-50 active:scale-95 text-[11px] font-bold tracking-wide transition-colors shrink-0 shadow-sm"><i data-lucide="users" class="w-3.5 h-3.5 mr-1 text-emerald-500"></i> <span id="scheduleBtnText">清潔排班</span></button>
+                </div>
             </div>
             <!-- 🌟 移除 overflow-hidden，將內部容器改為自適應高度與 pan-y 觸控通道，釋放滾動條 -->
             <div class="flex flex-1 w-full max-w-full h-auto min-h-full relative items-stretch">
@@ -15192,12 +15391,12 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                     <div id="mapWrapper" class="relative w-full h-[320px] bg-[#fdfbf7] rounded-xl overflow-hidden shadow-inner border-2 border-slate-300 transition-colors shrink-0" style="touch-action: pan-y;">
                         
                        <!-- 🌟 1/F 右上角：精簡版扁平圓角 2 字切換按鍵（最上層 z-[60] 不被人員穿過） -->
-                        <button id="mapRoleToggleBtn" type="button" onclick="window.toggleMapRoleMode()" class="absolute top-1.5 right-1.5 z-[60] bg-white hover:bg-indigo-50 text-indigo-700 font-black text-xs px-2 py-0.5 rounded-lg border border-indigo-400 shadow-xs active:scale-95 transition-all cursor-pointer select-none tracking-wider leading-tight">
-                            客服
+                        <button id="mapRoleToggleBtn" type="button" onclick="window.toggleMapRoleMode()" style="display:none;" class="absolute top-1.5 right-1.5 z-[60] bg-white hover:bg-indigo-50 text-indigo-700 font-black text-xs px-2 py-0.5 rounded-lg border border-indigo-400 shadow-xs active:scale-95 transition-all cursor-pointer select-none tracking-wider leading-tight">
+                            清潔
                         </button>
 
-                        <!-- 🅰️ 客服人員地圖圖層 (點擊背景空白處可切換為清潔地圖) -->
-<div id="mapCsLayer" class="absolute inset-0 pointer-events-auto cursor-pointer" onclick="window.toggleMapRoleMode('clean')">
+                        <!-- 🅰️ 客服人員地圖圖層（已停用，只保留清潔） -->
+<div id="mapCsLayer" class="hidden absolute inset-0 pointer-events-auto cursor-pointer" style="display:none;" onclick="window.toggleMapRoleMode('clean')">
                             <div class="absolute top-0 left-0 right-0 h-[40%] bg-blue-50/60 border-b-2 border-slate-300 pointer-events-none"><div class="absolute top-2 left-3 text-blue-300/80 font-black text-xl tracking-widest select-none">1/F</div></div>
                             <div class="absolute top-[40%] left-0 right-0 bottom-0 bg-emerald-50/60 pointer-events-none"><div class="absolute top-2 left-3 text-emerald-300/80 font-black text-xl tracking-widest select-none">地面層</div></div>
                             
@@ -15217,44 +15416,9 @@ window.pushMeetingReportsToAllIframes = (reports) => {
                             </div>
                         </div>
 
-                        <!-- 🅱️ 清潔人員地圖圖層 (點擊背景空白處可切換為客服地圖) -->
-                        <div id="mapCleanLayer" class="hidden absolute inset-0 pointer-events-auto cursor-pointer" onclick="window.toggleMapRoleMode('cs')">
-                            <!-- 第 1 層：一樓 -->
-                            <div class="absolute top-0 left-0 right-0 h-[33%] bg-blue-50/60 border-b-2 border-slate-300 pointer-events-none">
-                                <div class="absolute top-1.5 left-2.5 text-blue-300/90 font-black text-sm tracking-widest select-none">一樓</div>
-                            </div>
-                            <div class="absolute top-[4%] left-[50%] -translate-x-1/2 w-[42%] h-[22%] bg-blue-100/85 border-2 border-blue-400 rounded-lg flex flex-col justify-end pb-1 items-center shadow-inner hover:bg-blue-200/60 transition-colors" title="點擊切換模式">
-                                <div class="text-blue-700 font-black text-xs tracking-wide flex items-center pointer-events-none"><i data-lucide="sparkles" class="w-3 h-3 mr-1"></i>一樓+廁所</div>
-                            </div>
-
-                            <!-- 第 2 層：G層地面 / 魚檔 -->
-                            <div class="absolute top-[33%] left-0 right-0 h-[31%] bg-cyan-50/40 border-b-2 border-slate-300 pointer-events-none">
-                                <div class="absolute top-1.5 left-2.5 text-cyan-400/80 font-black text-sm tracking-widest select-none">G層地面</div>
-                            </div>
-                            <div class="absolute top-[37%] left-[50%] -translate-x-1/2 w-[52%] h-[20%] bg-cyan-100/80 border-2 border-cyan-500 rounded-lg overflow-hidden flex flex-col justify-end pb-1.5 items-center shadow-inner hover:bg-cyan-200/60 transition-colors" title="點擊切換模式">
-                                <i data-lucide="fish" class="w-7 h-7 text-cyan-500/15 absolute top-1.5 pointer-events-none"></i>
-                                <div class="text-cyan-800 font-black text-sm tracking-widest relative z-10 flex items-center pointer-events-none"><i data-lucide="droplets" class="w-3.5 h-3.5 mr-1"></i>魚檔</div>
-                            </div>
-
-                            <!-- 第 3 層：花園仔 -->
-                            <div class="absolute top-[64%] left-0 right-0 bottom-0 bg-emerald-50/60 pointer-events-none">
-                                <div class="absolute top-1 left-2.5 text-emerald-400/80 font-black text-sm tracking-widest select-none">花園仔</div>
-                            </div>
-
-                            <!-- 左：花園仔(男廁) -->
-                            <div class="absolute top-[73%] left-[3%] w-[25%] h-[23%] bg-sky-100/85 border-2 border-sky-500 rounded-lg overflow-hidden flex flex-col justify-end pb-1.5 items-center shadow-inner px-0.5 hover:bg-sky-200/60 transition-colors" title="點擊切換模式">
-                                <div class="text-sky-800 font-black text-[10px] tracking-tighter text-center leading-tight pointer-events-none">花園仔(男廁)</div>
-                            </div>
-
-                            <!-- 中：花園仔 -->
-                            <div class="absolute top-[73%] left-[31%] w-[28%] h-[23%] bg-green-100/85 border-2 border-green-500 rounded-lg overflow-hidden flex flex-col justify-end pb-1.5 items-center shadow-inner hover:bg-green-200/60 transition-colors" title="點GIS切換模式">
-                                <div class="text-green-800 font-black text-xs tracking-wider pointer-events-none">花園仔</div>
-                            </div>
-
-                            <!-- 右：花園仔(女廁)+(傷健廁所) -->
-                            <div class="absolute top-[73%] right-[3%] w-[36%] h-[23%] bg-rose-100/85 border-2 border-rose-400 rounded-lg overflow-hidden flex flex-col justify-end pb-1 items-center shadow-inner px-0.5 hover:bg-rose-200/60 transition-colors" title="點擊切換模式">
-                                <div class="text-rose-800 font-black text-[9.5px] tracking-tighter text-center leading-tight pointer-events-none">花園仔(女廁)<br>+(傷健廁所)</div>
-                            </div>
+                        <!-- 🅱️ 清潔人員地圖圖層（分區／樓層可自行新增與修改） -->
+                        <div id="mapCleanLayer" class="absolute inset-0 pointer-events-none">
+                            <div id="mapZoneLayer" class="absolute inset-0 pointer-events-none"></div>
                         </div>
                         <div id="mapPointsContainer" class="absolute inset-0 pointer-events-none overflow-hidden z-30"></div>
                     </div>
@@ -15679,6 +15843,33 @@ window.pushMeetingReportsToAllIframes = (reports) => {
         <div class="p-4 border-t border-slate-100 flex justify-end space-x-2 bg-slate-50/50">
             <button id="confirmBtnCancel" class="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-lg text-sm font-bold shadow-sm">取消</button>
             <button id="confirmBtnOk" class="px-4 py-2 bg-red-500 text-white rounded-lg text-sm font-bold shadow-sm">確定</button>
+        </div>
+    </div>
+</div>
+
+<div id="mapManageModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[340] hidden flex-col items-center justify-center p-2 sm:p-4">
+    <div class="bg-white rounded-2xl p-3 w-full max-w-[500px] shadow-2xl relative flex flex-col max-h-[90vh]" onclick="event.stopPropagation()">
+        <header class="flex justify-between items-center pb-2 mb-2 border-b border-slate-100 shrink-0">
+            <h3 class="font-bold text-sm text-slate-800 flex items-center"><i data-lucide="layout-grid" class="w-4 h-4 mr-2 text-blue-500"></i> 地圖管理（分區／崗位）</h3>
+            <button onclick="window.closeMapManageModal()" class="text-slate-400 p-1 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </header>
+        <p class="text-[11px] text-slate-500 leading-snug mb-2 shrink-0">位置以百分比計算（左上角為 0,0）。改名稱、搬位置、拉闊窄都即時生效；崗位框的人員標記會自動跟隨框的中心點。</p>
+        <div class="flex-1 overflow-y-auto scrollbar-hide space-y-2 pr-0.5">
+            <div class="text-[11px] font-black text-slate-700 tracking-wide flex items-center"><i data-lucide="layers" class="w-3.5 h-3.5 mr-1 text-slate-500"></i>分區／崗位框</div>
+            <div id="zoneManageList" class="space-y-1.5"></div>
+            <div class="flex gap-1 items-center pt-1">
+                <input id="newMapZoneName" placeholder="新分區名稱，例：五金區、天台…" class="flex-1 min-w-0 bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-[12px] font-bold focus:border-blue-500 focus:outline-none" onkeydown="if(event.key==='Enter')window.addMapZone('box')">
+                <button type="button" onclick="window.addMapZone('box')" class="shrink-0 px-2 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-[11px] font-black active:scale-95">＋崗位</button>
+                <button type="button" onclick="window.addMapZone('band')" class="shrink-0 px-2 py-1.5 bg-slate-500 hover:bg-slate-600 text-white rounded-lg text-[11px] font-black active:scale-95">＋樓層帶</button>
+            </div>
+            <div class="pt-2 border-t border-slate-100">
+                <div class="text-[11px] font-black text-slate-700 tracking-wide flex items-center mb-1.5"><i data-lucide="map-pin" class="w-3.5 h-3.5 mr-1 text-emerald-500"></i>崗位點位（人員顯示位置）</div>
+                <div id="pointManageList" class="space-y-1"></div>
+            </div>
+        </div>
+        <div class="mt-2 pt-2 border-t border-slate-100 flex justify-between items-center shrink-0">
+            <button type="button" onclick="window.resetMapLayout()" class="text-[10.5px] font-black text-amber-600 hover:underline">還原地圖預設</button>
+            <button type="button" onclick="window.closeMapManageModal()" class="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-bold active:scale-95">完成</button>
         </div>
     </div>
 </div>
